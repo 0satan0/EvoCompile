@@ -1,0 +1,742 @@
+# Compile 方案检索表（赢 / 减速 / 没跑起来）
+
+**运行时检索树**在 `memory/treememory`（JSON，可 evolve 插入节点）。
+每个方案的**正确用法案例**在 `memory/casememory/`（一经验一文件，frontmatter `scheme:` 与树叶同名；检索到方案时一起带给 Optimizer）。
+本文件是人读的方案卡。
+Hard match walk 那棵树。相似检索是 **双通道**：近邻赢局用来迁移，近邻败局用来禁止复探；
+`trials` 追加每次尝试（好坏都留），`cases` 只保留该任务目前最好的一条。打完当前方案后按
+`explore_from` 探下一个未试过的方案；大赢则 promote 树叶并记下 `paths`。
+
+Agent 输出仍是 `eval/recipes/<model>.json`。本文件按 **可观察特征 → 方案** 检索，
+不要按模型名硬记。细节数字在 `memory/speedupmemory`；repair 边界在 `memory/repairmemory`。
+对照永远是同进程 eager / vanilla=`torch.compile(model)` / agent。成功：`agent_ms < 0.95 * vanilla_ms`。
+
+被实验证伪的旧规则（QAT wrap、Titan 抄到 Bottleneck、一个 Bart JSON 扫全部 HF、leftover 一律 fullgraph、vanilla>eager 就 skip compile 等）在 `memory/oldversion/`，不要再检索进 recipe。8 轮主迭代说明见该目录 README。
+
+诊断入口：`diagnose_compile.py --scope fwd`（看模型 break，不要看 Dynamo 的 train_step glue）。
+
+检索顺序：
+1. naive 是否失败 → 先 S4 repair，能跑再谈加速。naive **能跑** 就不要只编 backbone（vision_maskrcnn）。
+2. 是不是 `HF_LLM_MODELS`？`compile(model)` + 外层 AMP 会 bwd dtype 挂 → **`--no-amp` 再 S3**。CSV 的 2.8–4.7× 是 Dynamo 把 autocast 编进 train_step，不是同进程 naive。
+3. `fwd` explain：热路径上是否有可修的 Python/tensor-if/setattr（不是层与层之间的静默 break）。
+4. 模块上是否有 `.layerdrop`（`hf_layerdrop_off` 打印 `n=`）。**n≥1 且 vanilla≈eager** → S2 强信号。n=0 → 不是 S2。
+5. 时间是否已经在 cuDNN LSTM / SDPA / FakeQuant / Privacy hook 上 → S5，不要强编。
+6. 剩余：fwd 0 break + 标准 Adam → **先读下面「S3 必须拆开」**，不要凡 BERT/ViT 都 `fullgraph+compile_optimizer`。
+
+CSV 怎么读（不要被「6–8 graph_breaks」骗）：
+- `unique_graphs` **1–3** + `graph_breaks` 5–8 → 几乎全是 Dynamo 编 train_step 的 glue。模型 forward 已是 1 张图。
+- `unique_graphs` **≥10** + `graph_breaks` ≥10 → 模型内部碎了。先 `diagnose --scope fwd`，走 **S1/S2**。
+- 同进程必须自己测 eager/vanilla。CSV AMP vanilla 不能当 `compile(model)` 对照。
+
+---
+
+## 三 bench 覆盖（2026-08-21）
+
+**Frozen Dynamo 训练 case 都写过 recipe、都测过同进程 eager / vanilla=`compile(model)` / agent。**
+llava / sam 是 `skip:not_training`。speech_transformer / pytorch_stargan 数字在独立 csv，已并入文末记分表。Titan 8 卡不在这张 1 卡表。
+
+「都优化过」= 每个训练 case 都按特征分过方案并落了 JSON，**不是**每个都过 5%。naive 已经 2–4× 的 CNN、厂商核、GNN/RL ~4ms，正确动作是 identity。
+
+| 范围 | 覆盖 | 过 5%（`agent < 0.95×vanilla`） | 几何平均 eager→vanilla→agent |
+|---|---|---|---|
+| HF frozen | **30/30** | **23**；4 ≈naive；3 慢（F2-skinny 误用 S3，JSON 尚未改回 identity） | 1.63× → **1.89×**（再 ×1.16） |
+| TIMM frozen | **18/18** | **1**（deit_tiny +13.6%）；其余 CNN/ViT-base 中位 +2% | 1.81× → 1.85×（再 ×1.03） |
+| TorchBench 训练 | **48/48**（50−llava/sam） | **6**（yolo、BERT_pytorch、speech、**vgg16 +5%、alexnet +13%、resnet18 skip-compile +18%**）+ **1 repair**（detectron） | — |
+| HF extra † | 5 | DebertaV2 / GPTNeo×2 / Blenderbot-CGen 过 5%；GPT-J 6B **OOM** | — |
+| Titan | 4 | 8 卡 pending / skip:later | — |
+
+失败 1 个：`GPTJForCausalLM` OOM。`basic_gnn_gcn` 已改 identity，probe 3.85/3.68/3.53 跑通（旧 `gcn_cached`+fullgraph setattr 挂）。
+drq 3ms 上 identity vs identity 的 +17% 当噪声，不算赢。
+GoogleFnet 已从 leftover 改成 **S3-step**（60.0→56.4，+5.9%）。
+
+全 case 数字见文末 **记分表**。
+
+可观察特征（`eval/inspect_features.py`）：`layerdrop_n`、`opt` 类型、`conv_param_frac`、`n_params` / `n_tensors`、`config.hidden_size`/`embed_dim`/`num_hidden_layers`/`vocab_size`/`model_type`、fwd `graph_count`、同进程 `vanilla/eager` 和 `vanilla_ms`。
+
+### 特征 → 动作（检索用）
+
+| 看到什么 | 不要做什么 | 做什么 |
+|---|---|---|
+| 热路径 Python 循环 / 无用 `setattr` / nonzero，naive≈eager | 按层切 Bottleneck（F1） | **S1** 修 break，再整网 `fullgraph=True` |
+| `.layerdrop` 且 **n≥1**；尤其 vanilla/eager ≤1.20 | n=0 还套 LayerDrop（F4）；把 Distil/T5 当 Bart | **S2** `hf_layerdrop_off` + 整网 fullgraph + `compile_optimizer` |
+| Transformer、标准 Adam、fwd 0 break、**vanilla/eager ≤1.20**、hidden≥768、≥12 层 | 再叠在已经 1.3×+ 的图上 `fullgraph=True` | **S3-unfused** fullgraph + compiled Adam |
+| 同上但 **vanilla 已 1.20–2.20×**、n_tensors~150–250、vanilla_ms≥25 | `fullgraph=True`（BERT_pytorch −6.9%） | **S3b** `fullgraph=False` + compiled Adam |
+| 24 层 / HF_LLM、hidden≥768、**vanilla_ms≥80** | MegatronBert（24 层但 vanilla 仅 57ms） | **S3-deep** compiled Adam；HF_LLM 必须 `--no-amp` |
+| ViT **embed_dim≤192**（DeiT-tiny）、Adam、leftover 1.2–1.8× | 把 DeiT-base / Swin / CLIP 当 tiny | **S3-tiny-vit** fullgraph + compiled Adam |
+| seq2seq **vocab≥1e5 或 params≥200M**（MT5 250k/300M） | T5/T5Small（vocab 32k / 60M）套同一 JSON | **S3-embed** compiled Adam |
+| `config.problem_type` setattr / sliding-window `.item()` | `fullgraph=True` | **S3b** |
+| `HF_LLM_MODELS` | 外层 AMP + `compile(model)` | **`--no-amp` + S3-deep**，或 `--amp --variants step` |
+| naive compile **失败** + 固定 shape backbone | 父 forward 仍被 trace；再编 ROI | **S4** |
+| naive **能跑** 的 Mask R-CNN | 只编 backbone | identity |
+| LSTM / FakeQuant / Opacus / SDPA / **EmbeddingBag / CombinedOptimizer** | 编进 Inductor | **S5** |
+| **FNet FFT**（`only_fp32`、cuFFT fallback） | 整网 `fullgraph=True` / 只编 Adam | **S3-step** `compile(train_step)`；FFT 仍走 cuFFT |
+| 0-break、profiler **other%≥50**（Python / `opt.step` 仍在图外） | 只编 `opt.step`（S3b）还不够；也不要再 `compile(model)` | **S3-step** `compile_step` + `actions: []` |
+| `HF_LLM_MODELS` 且 fwd 0-break | 外层 AMP + `compile(model)` | **S3-step** `compile(train_step)`（官方 Dynamo wrap）；S3-deep compile_adam 是 explore |
+| 名叫 CNN 但 **conv_frac<0.3**、P **sync 高**、标准 Adam（VGG/AlexNet 分类头） | 当 F2-cnn identity；只 `fullgraph` | **S3-fc** compiled Adam |
+| `conv_param_frac≥0.3` 且 fwd 0 break（CNN / visformer 0.98 conv） | fullgraph 或 compiled Adam（真 CNN） | **F2-cnn** identity；**官方 leftover 若 silu\|mul 拆开** → **S6-fuse** `silu_mul`（先于 F2-cnn） |
+| **vanilla > eager**（compile 回归） | identity=`compile(model)` 仍慢于 eager | **skip compile**：`actions: []`（不要 `compile path=""`） |
+| distilbert / n_layer≤6 且 vanilla≥2.3× / Electra hidden≤256 / MobileBert n_tensors>500 / vanilla≥2.3× | 「凡 BERT 都 S3」 | **F2-skinny** identity；若 I-channel 是 unfused bmm+softmax，下一探 **S6-sdpa**（in-tree F.sdpa + `compile(train_step)`） |
+| I-channel `bmm` + triton softmax、没有 flash/efficient ATen | 先写 naive Triton `tl.dot` GEMM；只 hook DistilBERT 名字；`compile(model)` leftover | **S6-sdpa**：按 leftover 特征（不是模型名白名单）。attention hook + `compile_step`。I-channel 看 **正在 overlay 的 wrap**（官方 `compile(train_step)`，或当前 recipe 的 residual），不是永远 `compile(model)` |
+| extern addmm + 单独 gelu，或 silu\|mul 拆开 | naive `tl.dot` 换 cuBLAS；自定义 CUTLASS conv 换 cuDNN；Repair 删 kernel 过 allclose | **S6-fuse**：CUTLASS GEMM+GELU 目录核 / `silu_mul`，然后 `compile_step`。Repair **禁止** 为过 numerics 删 `replace_pattern` |
+| `_DenseLayer` 很多 | `fullgraph=True`（densenet −23%） | **F6** identity |
+
+同一 JSON 既有 +50% 又有 −68%，说明检索键不够细。赢/输必须能被上表分开，不能停在「BERT-like / leftover 1.3–2.5×」。
+
+---
+
+## 方案卡（加速成功：遇到同样特征就套）
+
+### S1 热路径 Graph Repair → 整网 `fullgraph=True`
+
+**什么时候用**
+- `diagnose` 模型 forward+loss 有 **很多 break**（通常 ≥10）。
+- break 落在 **热路径内部**，把本来能融的 conv/Transformer 塔撕碎。
+- naive `compile(model)` ≈ eager（没真正编进去），或明显弱于「合图后」的预期。
+- break **不是** 已经融合好的重复 block 之间的缝（那种用 S1 会变慢，见 F1）。
+
+**根据什么决定**
+- `torch._dynamo.explain` 的 break 原因是可 tensorize 的 Python：
+  data-dependent slice、`aten.nonzero`、train 路径上无用的 `setattr`、numpy inf。
+- Actionspace A（Graph Repair）然后整网一张图，不是 Titan 按层切（F1）。
+
+**动作**
+1. `rewrite_class_forward` / 专用 patch，消掉热路径 break。
+2. `compile path="" fullgraph=True`，`cudagraphs=False` 若 shape 仍有一点动态。
+3. **不要** 再按 EncoderLayer/Bottleneck 切开。
+
+**实例**
+
+| case | 观察到的特征 | 修了什么 | eager / vanilla / agent | vs naive |
+|---|---|---|---|---|
+| speech_transformer | 17 CSV break；fwd 7 graphs。break 在 `get_non_pad_mask` Python 循环 + `Decoder.preprocess` nonzero，**不是** 层间 | 向量化 pad-mask；preprocess scatter；inplace→`*`；`-np.inf`→Python inf；然后整网 fullgraph | 39.0 / 35.4 / **33.6** | +5.2% |
+| yolov3 | 25 break ≈ eager。`YOLOLayer.create_grids` → `setattr(self.nx)`，train 根本不用 grid | `yolo_layer_train_no_grid`；Darknet fullgraph | 68.8 / 68.8 / **44.7** | +35% |
+
+**检索词**：热路径 break、setattr、nonzero、pad-mask 循环、naive≈eager、合图。
+
+---
+
+### S2 HF LayerDrop 关掉 + 整网 fullgraph + compiled Adam
+
+**什么时候用**
+- HF encoder-decoder 或 decoder 栈；`diagnose --scope fwd` 每层一次 Dynamic control flow。
+- 模块上有 `.layerdrop`，`hf_layerdrop_off` 返回 **n≥1**。encoder+decoder 常 n=2（M2M / whisper / Blenderbot-CGen）。
+- 默认 `layerdrop` 常为 0，但 `torch.rand([]) < layerdrop` 仍被当成 Python `if`，**每层一次 break**。
+- **强信号**：同进程 vanilla ≈ eager（LayerDrop 把 `compile(model)` 撕碎）。CSV vanilla 快是 Dynamo wrap，不要被骗。
+- 标准 `torch.optim.Adam`。
+
+**根据什么决定**
+- M2M100 `explain`：break 全是 LayerDrop tensor-if。Bart/MBart/PLBart/Pegasus/Blenderbot/TrOCR/whisper 同构。
+- OPT/XGLM 虽是 decoder-only，仍有 `.layerdrop`（n=1），同一张卡。
+- 只修 LayerDrop + fullgraph 往往只剩 ~3%。过 5% 靠 **再编 `opt.step`**（S3）。S2 = 合图 + S3。
+- n=0（T5 / MT5）→ F4，不要当 S2。
+
+**动作**
+```json
+{ "compile_optimizer": true,
+  "actions": [
+    {"op": "hf_layerdrop_off"},
+    {"op": "compile", "path": "", "fullgraph": true, "dynamic": false}
+  ] }
+```
+看日志 `hf_layerdrop_off n=`：n=0 不要当 S2，改判 S3 或 F4。
+
+**实例（同进程 AMP，warmup8/measure40）**
+
+| case | n | eager / vanilla / agent | vs naive |
+|---|---|---|---|
+| M2M100ForConditionalGeneration | 2 | 100.0 / 82.9 / **64.4** | +22% |
+| BartForCausalLM | 1 | 69.1 / 59.9 / **53.5** | +11% |
+| MBartForCausalLM | 1 | 107.9 / 59.7 / **55.3** | +7.4% |
+| PLBartForCausalLM | 1 | 96.3 / 48.6 / **45.9** | +5.5% |
+| PegasusForCausalLM | 1 | 72.1 / 48.3 / **42.0** | +13% |
+| BlenderbotForCausalLM | 1 | 157.1 / 143.7 / **85.2** | +41% |
+| TrOCRForCausalLM | 1 | 133.7 / 81.2 / **75.6** | +6.8% |
+| OPTForCausalLM | 1 | 148.0 / 58.7 / **54.1** | +7.9% |
+| XGLMForCausalLM | 1 | 89.5 / 77.4 / **48.7** | +37% |
+| **openai/whisper-tiny** | 2 | 32.81 / 31.55 / **22.00** | **+30%** |
+| **BlenderbotForConditionalGeneration** | 2 | 376.7 / 325.4 / **245.5** | **+25%** |
+
+Blenderbot / XGLM / whisper：vanilla 几乎没比 eager 快（LayerDrop 把图撕碎）；修完才接近 Dynamo CSV 那条 wrap。这是 S2 的强信号，不是「naive 已经够好」。ConditionalGeneration 是 CausalLM 的 encoder+decoder 版（n=2）。
+
+**反例（不要当 S2）**：T5ForConditionalGeneration `n=0`（模块没有 `.layerdrop` 属性）→ F4。
+
+**检索词**：LayerDrop、`torch.rand([])`、n≥1、HF CausalLM、encoder-decoder。
+
+---
+
+### S3 模型已是 1 张图：编标准 Adam `opt.step`（可 `fullgraph=False`）
+
+**什么时候用**
+- `diagnose --scope fwd`：**0 break**（或只剩必须留的 setattr / `.item()`）。
+- 标准 `torch.optim.Adam`（不是 FastNLP AdamW / SGD / RMSprop）。
+- vanilla `compile(model)` 已经明显快于 eager（约 **1.3–2.5×**），但还差 5%。
+- 很多小参数：embedding + 每层 QKV。层数越多、步长越大，Adam 碎 launch 占比越高。
+
+**S3 必须拆开（同一「BERT-like + compiled Adam」赢/输相反）**
+
+观测（`inspect_features.py`）把下列 case 分成不同方案，禁止共用一张 Distil/T5 复制过来的 JSON：
+
+| 子类 | 可观察特征 | 动作 | 赢 | 若误用 |
+|---|---|---|---|---|
+| **S3-unfused** | fwd 0 break，Adam，hidden≥768，≥12 `BertLayer`/`GPT*Block`，**vanilla/eager ≤1.20** | fullgraph=True + `compile_optimizer` | Bert 65/59/56（+5.6%） | |
+| **S3b** | 同上但 **vanilla 已 1.20–2.20×**，或 setattr/`.item()` | **fullgraph=False** + `compile_optimizer` | GPT2-cls +9.4%；**BERT_pytorch 42.6/31.3/27.9（+10.9%）** | BERT_pytorch `fullgraph=True` **−6.9%** |
+| **S3-deep** | ≥20 层或 HF_LLM，hidden≥768，**vanilla_ms≥80** | compiled Adam；LLM `--no-amp` | GPTNeo +17%、DebertaV2 +27%、Llama +46% | **MegatronBert 24 层但 vanilla 仅 57ms → −36%**（步长不够，走 F2） |
+| **S3-tiny-vit** | ViT `embed_dim≤192`，Adam，leftover 1.2–1.8× | fullgraph + compiled Adam | **deit_tiny +13.6%** | deit_base embed 768 只有 +4.1%；visformer `conv_frac=0.98` 是 CNN |
+| **S3-embed** | `vocab_size≥1e5` 或 params≥200M（MT5 250112 / 300M） | compiled Adam | MT5 +17% | T5/T5Small vocab 32k / 60M 只有 +3%（F4） |
+| **S3-fc** | torchvision 分类头：`conv_frac<0.3`、P sync 高、Adam（VGG/AlexNet）；或 LSTM-break 但 P 仍是 sync+Adam（demucs） | compiled Adam；VGG 保留 `fullgraph=True`；demucs `fullgraph=False` | **vgg16 +5%**；**alexnet +12%**；**demucs 406→398（+2%）** | 真 CNN `conv_frac≥0.3` 编 Adam 常更慢（resnet50 29→32） |
+| **S3-step** | 0-break 但 leftover 在 `compile(model)` 外：P other% 高、cuFFT fallback（FNet）、HF_LLM 0-break | `compile_step` + `actions: []`（**不要再 compile(model)**） | GoogleFnet +5.9%；GPTNeoCLM 195.5→193；官方 Dynamo wrap | Deberta step 挂；moco wrap 更慢；yolov3 走 S1 不要 wrap |
+| **F2-skinny** | `model_type=distilbert` 或 n_layer≤6 且 vanilla≥2.3×；Electra hidden 256 / 13.5M；MobileBert `n_tensors>500` | identity；DistilBert 有 unfused bmm+softmax 时下一探 S6-sdpa | DistilBert S6-sdpa +6.2% | DistilBert 同一 S2 JSON **−68%**；Electra +1.6%；MobileBert −6% |
+| **S6-sdpa** | `unfused_bmm_attention`（extern bmm + triton softmax，无 flash ATen） | attention hook + `compile_step`（不要 nest `compile(model)`）。DistilBert/OPT：in-tree F.sdpa；长 S / ≤16 causal / longformer：vendor CUTLASS FMHA；4D rel-bias：Triton tiled FA。S≤128 FA overlay 常输（bwd tax） | **OPT 1.28×**、**Longformer 1.37×**、**M2M100 2.04×** vs official step；DistilBert +7.6% | naive Triton FA 第一动作；手写 tiled CUTLASS FA（仍 ~30×）；S≤128 HF Sdpa 已融 |
+| **S6-fuse** | leftover Linear+GELU / SE silu×mul / launch-HBM poi | `replace_pattern` 后 `compile_step`。GEMM+act → catalog **addmm_gelu（CUTLASS）**；SE → **silu_mul** 留 cuDNN conv | **mobilenetv2_100 1.07×**、mnasnet 1.04×、efficientnet 1.03× | naive `tl.dot` vs cuBLAS（Bert 0.887×）；CUTLASS conv vs cuDNN；bwd 重算 GEMM 的 e2e 税 |
+| **F2-cnn** | `conv_param_frac≥0.3` 且 fwd 0 break | identity | — | leftover CNN 上 S3fg 中位 −0.6% |
+| **F2-eager** | **vanilla > eager**（小步长 compile 回归） | 先去掉多余 `fullgraph`（identity）。`actions: []` 只在**干净进程**测过才用（resnet18） | **resnet18 11.7→9.97** | mv3/dp/densenet 同进程 vanilla→skip-compile 会污染 |
+
+**还要看**
+- `opt` 必须是 `torch.optim.Adam`。`SGD` / `RMSprop` / `CombinedOptimizer` / `*Schedule` → 不编 opt（F2）。
+- `n_tensors~200` 且大量小 tensor 才有 foreach Adam 碎 launch。DeepRecommender 12 个 embedding + SGD → 编 Adam 没对象。**VGG/AlexNet 不是这条**：名字像 CNN，但 `conv_frac` 0.04–0.11、P 是 sync，编 Adam 有效（S3-fc）。
+- TIMM **base** ViT / Swin / CLIP / siglip / beit：embed 768，Adam 只 +2–4% → F2-vit-base，不要当 S3-tiny-vit。
+- HF_LLM：外层 AMP + `compile(model)` 可能挂。`--no-amp` S3-deep，或 `--amp --variants step`。
+
+**动作（无残留 Python）**
+```json
+{ "compile_optimizer": true,
+  "actions": [{ "op": "compile", "path": "", "fullgraph": true, "dynamic": false }] }
+```
+**动作（setattr / `.item()` 必须留着）**
+```json
+{ "compile_optimizer": true,
+  "actions": [{ "op": "compile", "path": "", "fullgraph": false, "dynamic": false }] }
+```
+**动作（HF_LLM）**
+- 默认 recipe：上面 JSON + 命令行 `--no-amp`（AMP 在图外，关掉）。
+- 对齐 Dynamo：`--amp --variants eager,vanilla,step`，编 **train_step**（autocast 在图内）。Llama 上这是唯一能 AMP 跑起来的边界；Qwen 上 step 比 `compile(model)` 再快 22%。
+
+`agent_loop` 会先 dummy step 填 Adam state 再 `opt.step = torch.compile(opt.step)`。默认 variants 是 `eager,vanilla,agent`，**不会**自动跑 `step`。
+
+**实例（算加速成功）**
+
+| case | 特征 | eager / vanilla / agent | vs naive |
+|---|---|---|---|
+| BertForMaskedLM | unique_graphs=2；fwd 0 break | 65.0 / 59.0 / **55.7** | +5.6% |
+| LayoutLMForMaskedLM | BERT 变体 | 105.6 / 51.3 / **47.8** | +6.8% |
+| AlbertForMaskedLM | 参数多、步长大 | 521.2 / 304.9 / **285.3** | +6.4% |
+| XLNetLMHeadModel | 步长很大 | 530.0 / 291.0 / **136.0** | +53%（loss=nan） |
+| **DistillGPT2** | unique_graphs=2；n=0 | 81.2 / 40.4 / **38.1** | **+5.6%** |
+| **YituTechConvBert** | unique_graphs=2；n=0 | 122.4 / 70.4 / **66.5** | **+5.5%** |
+| **RobertaForCausalLM** | unique_graphs=2；n=0 | 131.9 / 59.1 / **55.1** | **+6.7%** |
+| **GPT2ForSequenceClassification** | `config.problem_type` setattr | 49.4 / 37.9 / **34.4** | **+9.4%**（**fullgraph=False**） |
+| **GPTNeoForCausalLM** | 24 block、0 break、P sync 60% | 403.8 / 234.4 / **193.2** | **+18%**（S3-step；旧 S3-deep 195.5） |
+| **GPTNeoForSequenceClassification** | 同 GPT2-cls setattr | 360.6 / 218.8 / **179.5** | **+18%**（**fullgraph=False**） |
+| **DebertaV2ForMaskedLM** | 0 break、24 层 | 136.1 / 96.9 / **70.6** | **+27%**（S3b；fullgraph=True 无额外收益） |
+| **Llama-3.2-1B `--no-amp`** | 外层 AMP 会挂；fp32 + compiled Adam | 105.3 / 81.1 / **44.0** | **+46%** |
+| **gemma-2-2b `--no-amp`** | 同 Llama wrap | 215.2 / 164.7 / **87.3** | **+47%** |
+| **Qwen3-0.6B `--no-amp`** | 同 HF_LLM wrap；CSV AMP 4.7× 不是 naive | 98.2 / 61.6 / **38.8** | **+37%** |
+| **MT5ForConditionalGeneration** | n=0；vocab 250k / 300M（S3-embed） | 82.7 / 47.7 / **39.7** | **+17%** |
+| **deit_tiny** | embed_dim=192（S3-tiny-vit） | 32.3 / 23.9 / **20.7** | **+13.6%** |
+| **BERT_pytorch** | 12 TransformerBlock、vanilla 1.36×；**不要 fullgraph** | 42.6 / 31.3 / **27.9** | **+10.9%**（S3b） |
+| **GoogleFnet** | only_fp32 cuFFT fallback；不要 fullgraph FFT | 91.6 / 60.0 / **56.4** | **+5.9%**（S3-step `compile_step`） |
+
+**HF_LLM 的第二种动作（AMP 留在图里）**：`torch.compile(_step_fn)`（`agent_loop --variants step --amp`）。autocast 在编译边界内，dtype 一致。Llama：`compile(model)`+外层 AMP **挂**；`compile(train_step)` **46.2ms**（对照 Dynamo CSV 43.5ms）。Qwen AMP：vanilla `compile(model)` 58.1 → step **45.2（+22%）**。这不是默认 agent recipe，是 Dynamo 官方 harness 的边界。
+
+**S3-step（`recipe.compile_step`，编整段 train_step = 官方 Dynamo wrap）**
+- naive 对照永远是 `torch.compile(model)`。本方案是检索到的优化动作，不是新的 naive。
+- 模型 forward 已 fused，或中间是厂商核 fallback（cuFFT），`compile(model)+compile(opt.step)` 吃不到 loss/bwd/opt 的 Python。
+- **检索特征**（`leftover_step`）：FNet；HF_LLM 0-break；0-break 且 profiler other%≥50。排除 moco / YOLO / skinny / S3-fc 分类头。
+- 动作：不要再 `compile(model)`；`torch.compile(_step_fn)` 把 loss/bwd/Adam 收进一张图。FFT 仍走 cuFFT。
+- **GoogleFnet**：91.6 / 60.1 / **56.6（+5.9%）**。旧 recipe fullgraph+Adam 只有 +1%。
+- **GPTNeoForCausalLM**：234.4 / **193.2** vs 旧 fullgraph+Adam 195.5。
+- **HF_LLM**：官方 harness 是 `compile(train_step)`；`compile(model)+外层 AMP` 会把 autocast 留在图外。
+- **反例**：T5 贴线；Longformer 不稳；DebertaV2 `CppCompileError`；**moco wrap 慢于 naive**；yolov3 走 S1 rewrite。不要套只剩厂商 conv 且 other% 不高的 identity CNN。
+
+S2 里 M2M/Bart 过 5% 的后半段也是 S3。S2 = LayerDrop 合图 + S3。
+
+**不要当 S3**：F2-skinny / F2-cnn / F2-vit-base；T5 vocab 32k；UNet+RMSprop；torchrec CombinedOptimizer。FNet 走 S3-step，不要 S5 identity。
+
+**检索词**：0 model break、compiled Adam、foreach、fullgraph=False setattr、`--no-amp` HF_LLM、24 层大步长。
+
+---
+
+### S4 静态张量区 compile；Python / 动态结构 eager（repair 兼加速）
+
+**什么时候用**
+- naive `torch.compile(model)` **失败**（Python 目标检测对象、动态 RoI）。
+- 网络里有一块 **固定 shape 的 conv/backbone**，其余是 Python 数据结构 / 采样。
+
+**根据什么决定**
+- Dynamo 全局 eval_frame：只 compile 子模块但父 forward 仍被 trace → 仍会扫到 Polygon（855ms）。
+- 必须 `disable` 外层 meta-arch，再 compile backbone；动态 RoI 关 cudagraphs。
+
+**动作**：`disable_forward` 父与 RPN/ROI；`skip_code_on_types` Polygon/Instances/Boxes；只 `compile backbone`；`cudagraphs=False`。
+
+**实例**：detectron2_maskrcnn_r_50_c4 — vanilla fail，agent 85.9ms vs eager 91.3ms。
+再 compile ROI（`dynamic=True`）能跑但 110ms，慢于 eager → F3。
+
+**反例（不要当 S4）**：vision_maskrcnn **train** naive 已经能跑。42 个 break 在 transform `.item()` / RPN NMS，但 `compile(model)` 仍把 backbone 编进去。只编 backbone −4.4%。**已改 identity**。CSV 110→58 是 eval-mode。
+
+**检索词**：naive fail、检测分割、Polygon、meta-arch disable、只编 backbone。
+
+---
+
+### S5 厂商核 / hook 留 eager（上限往往 <5%，不当加速主方案）
+
+**什么时候用（预期：能跑或略快，不承诺过 5%）**
+- 时间在 cuDNN LSTM / FlashAttention-SDPA / FakeQuant observer / Opacus GradSample hook。
+- Actionspace D：这些 region 已经是高度优化 kernel，Inductor 重编会破坏路径。
+- 同样：**EmbeddingBag / torchrec CombinedOptimizer / 巨大 embedding 矩阵 + SGD**（torchrec_dlrm vanilla≈eager；nvidia_deeprecommender 12 个大 tensor + SGD）。
+- **FNet FFT**：不要 `fullgraph` 重编 cuFFT（AMP 也会挂，`only_fp32`）。加速走 **S3-step**，不是 identity。
+
+**实例（未过 5%，但边界正确）**
+- tts_angular：LSTM 留 cuDNN，只编 3 个投影 Linear → 12.03 / 11.23 / 10.99（+2%）。
+- fastNLP_Bert：wordpiece `.item()`+numpy 不能 tensorize。**只编 inner encoder fullgraph 是 −18%**。**已改 identity** = `compile(model)`（wordpiece 自然 break）。自定义 FastNLP AdamW 不要编。
+- moco：32×Bottleneck 慢于 eager。encoder 各一张图也曾 −1%。**已改 identity**（52.2≈naive）。
+- opacus：naive compile **能跑**（37.9）。hooks+`_module` 的 S5 是 38.3。**已改 identity**。
+- QAT：fp32 + 让 FakeQuant 自然 break；不要 wrap 每个 FakeQuant。
+- **demucs**：LSTM 必须留 cuDNN（S5 break），但 P 仍 91% sync。Titan 按 Sequential 切 −1.3%。**compile(model)+compiled Adam 406.4→398.4（+2%）**。compile_step 400 持平。不要把 LSTM 编进 Inductor。
+
+**检索词**：cuDNN LSTM、SDPA、FakeQuant、PrivacyEngine、vendor kernel、EmbeddingBag、FNet FFT。
+
+---
+
+### S6-fuse 自定义 kernel（CUTLASS / Triton）——只在能超过官方 compile 时检索
+
+**目的**：官方 `compile(train_step)` 已经把能融的融了。剩下要么是 **HBM 往返**（cuBLAS GEMM 写出再读回来做 gelu），要么是 **拆开的 pointwise**（SE silu×mul）。Agent 必须把算子 **register + FX rewrite 插进 leftover 位点**，再 `compile(train_step)`，kernel 才会被调用并产生加速。
+
+协议：leftover inspect → 官方 wrap `compile(train_step)` → overlay `compile(train_step)`。**不要** nest `compile(model)`。
+
+**检索 key（`has_unfused_epilogue` = `sites_from_features` 非空）**
+
+| 看到什么 | 不要做什么 | 做什么 |
+|---|---|---|
+| extern `addmm/mm` + 单独 triton gelu，triton/copy 占比够 | naive `tl.dot` 换 cuBLAS（Bert catalog **0.887×**）；bwd 里重算 addmm（e2e **0.80×**） | catalog **`addmm_gelu`**：CUTLASS Gemm + `LinearCombinationGELU`；autograd 存 pre-GELU `z` |
+| `silu` 和 `mul` 落在不同 triton 名字（SE / SwiGLU） | 把旁边的 cuDNN conv 重写成 CUTLASS conv | catalog **`silu_mul`**，conv 留厂商。mobilenetv2_100 **1.07×**、mnasnet **1.04×**、efficientnet **1.03×** |
+| ≥4 个 `triton_poi_*` **并且** leftover triton/copy 占比够 | 仅凭「很多 poi 名字」 | 生成 Triton pointwise；`register()` + FX pass |
+| leftover **cuDNN conv** / 稀疏 GNN / QAT / FFT | 自定义 CUTLASS conv | **identity / inspect_only**（s103 43 case） |
+| 光有 hint `missed_gemm_epilogue`、没有 I-channel 名字 | 当检索键 | 不是 S6 |
+| 只有 Flash/SDPA | 当 S6-fuse | **S5** 或已经融了 |
+| I-channel `bmm`+softmax、无 flash ATen | 当 S6-fuse 写 GEMM | **S6-sdpa** |
+
+**动作（insert contract）**
+
+```json
+{ "compile_step": true,
+  "actions": [
+    {"op": "replace_pattern", "kernel": "__generate__"}
+  ] }
+```
+
+KernelWriter 对 Linear+GELU / silu×mul **直接用目录核**（已经有 `register()` + `custom_op` + `register_autograd` + `pass_install`）。其它 poi 才生成 `eval/kernels/generated/<id>.py`。缺任何一项，op 进不了图、不会被调用。`apply_recipe` 在任何 `compile` **之前** `kernels.register`。
+
+---
+
+### S6-sdpa 融合注意力（vendor FMHA / Triton FA）
+
+**检索 key（`unfused_bmm_attention`）**
+
+I-channel：extern `bmm` + triton 名含 `softmax`，aten 没有 `_scaled_dot_product_flash_attention` / `efficient_attention`。dlrm/moco 的 bmm 没有 softmax，不是这个 flag。官方 leftover 几乎总是 `extern bmm`（cuBLAS）+ fused Triton softmax——compile **不会** pattern-match 成 SDPA/Flash。
+
+**特征分流（`attn_policy`，不是模型名白名单）**
+
+| 特征 | backend | 例 |
+|---|---|---|
+| DistilBert / 小 S 浅栈 | in-tree `F.sdpa`（`sdpa_rewrite`） | DistilBert 53.10→49.36（+7.6% vs official step） |
+| causal 且 1≤n_layer≤16、长 S | vendor CUTLASS FMHA | OPT 54.7→42.9 **1.28×** |
+| longformer 滑窗长 S | vendor CUTLASS FMHA | Longformer **1.37–1.46×** |
+| n_layer 30–40、无 4D bias | vendor CUTLASS FMHA | M2M100 **2.04×** |
+| 4D rel-bias / softcap | Triton tiled FA | T5 / XLNet / Gemma |
+| S≤128 且已经 `*SdpaAttention` | 不要 overlay | s103 多数 HF：FA overlay ≤1.00×（bwd tax） |
+
+手写 tiled CUTLASS FA（WMMA + `cp.async`）在 S=2048 上仍比 vendor Flash **~30×**，不要 `GKO_CUTLASS_HANDWRITTEN=1` 当 overlay。
+
+**何时**
+
+I-channel 必须是 **当前继续优化的 compile wrap** 的 leftover：第一探 S6 看官方 `compile(train_step)`（`leftover_channels.official_step`），depth/repair 看上一轮 residual。不要用 naive `compile(model)` leftover 去判 silu_mul / unfused bmm。第一叶 DistilBert 仍是 **F2-skinny identity**（skinny 保护）。其后 unfused bmm+softmax（任意模型名）硬检索 **S6-sdpa**，排在 S3b / S6-fuse 之前。Longformer/T5 必须 hook 到真实 attention 模块（`q/k/v/o`、LongformerSelfAttention），让 `fused_attention` 被调用。Repair **禁止** 删 kernel/rewrite 来过 `rel_loss`。
+
+**不要**
+
+- DistilBert 上自定义 Triton FA 当第一动作
+- nest `compile(model)` + `compile_step`
+- 改 `eval/recipes/DistilBertForMaskedLM.json` 的 gold identity
+- 手写 tiled FA 当 vendor 级
+
+**动作**
+
+DistilBert / OPT：
+
+```json
+{ "compile_step": true,
+  "actions": [ {"op": "apply_rewrite", "rewrite": "sdpa_rewrite"} ] }
+```
+
+其它 unfused bmm+softmax：
+
+```json
+{ "compile_step": true,
+  "actions": [
+    {"op": "replace_pattern", "kernel": "fused_sdpa", "backend": "auto"},
+    {"op": "apply_rewrite", "rewrite": "fused_sdpa_attn"}
+  ] }
+```
+
+`fused_sdpa_attn.apply` 会 `register(fused_sdpa)` 并按 n_layer/kind 设 `attn_policy`，然后把 `*SelfAttention` / OPT-like `q_proj` 的 forward 换成 `fused_attention`。
+
+---
+
+### F6 DenseNet / concat 拓扑不要 `fullgraph=True`
+
+**误用的方案**：S3fg「fwd 0 break 就整网 fullgraph」。
+**何时变慢**：`_DenseLayer` 很多（densenet121 有 58 个），concat 把图变宽，`fullgraph=True` 比 naive `fullgraph=False` 慢。
+**实例**：densenet121 322 / 237 / **292（−23%）**；**phlippe_densenet** 27.7 / 28.6 / 28.9（fullgraph −1%，已 identity）。ResNet add-residual 上 fullgraph ≈ 0%，不是同一方案。
+**动作**：identity。
+
+---
+
+## 减速卡（这些特征下采用某方案会变慢）
+
+### F1 拆开已经融合的重复 block（错用 Titan 按层 compile）
+
+**误用的方案**：S1 的「按 EncoderLayer / Bottleneck / Sequential `fullgraph=True`」。
+**何时变慢**：`explain` 显示 break **不在** 层内部，naive 已经把 6–12 层融进少数几张大图。
+**为什么**：每层一张图 = 多次 guard/launch，GPU 活不够大（ResNet Bottleneck ≠ Llama block @ seq4096）。
+
+| 错法 | case | 结果 |
+|---|---|---|
+| 12× Encoder/DecoderLayer | speech_transformer | 36.4 vs vanilla 34.3 |
+| 32× Bottleneck | moco | 63.6 **慢于 eager** 56.6 |
+| 12× conv Sequential | demucs | 416 vs vanilla 406 |
+| 切 BertLayer / ViT Block | Bert / dinov2 | ≈0 或略慢 |
+
+正法：speech 先修热路径再整网一张图（S1）；moco 整段 encoder 一张图（S5 粒度）。
+
+---
+
+### F2 编 `opt.step` 但 optimizer 不是「多小参数标准 Adam」
+
+**误用的方案**：S3 `compile_optimizer`。
+**何时变慢**
+
+| 特征 | case | vanilla → agent |
+|---|---|---|
+| 只编 FastNLP Bert encoder `fullgraph=True` | fastNLP_Bert | 39.5 → 46.6（**−18%**）；已改 identity |
+| SGD + ResNet（MoCo） | moco | 52.2 → 52.7 |
+| DistilBert（更小、vanilla 已经 2.6× eager） | DistilBertForMaskedLM | 66.7 → **112.2（慢 68%）** |
+| MegatronBert n=0 | MegatronBertForCausalLM | 57.2 → **77.7（慢 36%）** |
+| MobileBert 极碎、compile 184s | MobileBertForMaskedLM | 87.8 → 93.4 |
+| Electra vanilla 已 2.4× | ElectraForCausalLM | 33.24 → 32.72（+1.6%，浪费 compile） |
+| CNN 0-break（conv 核已满） | Background_Matting | 93.78 → 93.40（+0.4%） |
+| 24 层但 vanilla 仅 57ms | MegatronBertForCausalLM | 57.2 → **77.7（慢 36%）** |
+| hidden 256 / 13.5M | ElectraForCausalLM | 33.24 → 32.72（+1.6%） |
+| ViT-base embed 768 | deit_base / beit / visformer | +1.9–4.4%，不过 5% |
+| leftover CNN `fullgraph=True` | densenet121 | 237 → **292（−23%）** |
+
+**为什么**：compiled Adam 有固定 overhead。vanilla 已经把模型融好、或参数少/核已经大，再编 opt 只加 launch。DistilBert/Megatron 还叠了 `fullgraph=True`（n=0 无 LayerDrop 可修），等于在已经好的图上换一种更差的 wrap。
+
+**规则**：S3 看的是「Adam 碎 launch 是否还剩 5%」，不是「凡 BERT 都编 Adam」。用上面 S3 子类表，不要用「1.3–2.5× BERT-like」一把抓。
+- **用**：S3-unfused / S3b / S3-deep / S3-tiny-vit / S3-embed。
+- **不用**：vanilla ≥2.3×；hidden≤256 或 n_layer≤6 且已经 ≥2×；MobileBert 上千 tensor；24 层但 vanilla_ms<80（Megatron）；CNN `conv_frac≥0.3`；自定义 / SGD / RMSprop / CombinedOptimizer；ViT-base+。
+- 新 BERT-like：先读 `vanilla/eager` 和 `vanilla_ms`。≤1.20 才允许 `fullgraph=True`；已经 1.3× 只编 `opt.step`。
+
+---
+
+### F3 边界切在碎片上 / 父级仍被 trace
+
+**误用的方案**：S4 但忘了 disable 父 forward；或每个 FakeQuant/hook 一个边界。
+
+| 错法 | 结果 |
+|---|---|
+| detectron 不 disable meta-arch | 855ms vs eager 91 |
+| detectron 再编 ROI `dynamic=True` | 110ms vs eager 91 |
+| 每个 FakeQuant wrap 再 compile rest | mobilenet 152 vs naive 101；resnet 96 vs 78 |
+| QAT `max-autotune` | 98.6 vs default inductor 95.5，compile 379s |
+
+边界必须落在 **一块大静态张量** 上，不是每个 observer。
+
+---
+
+### F4 无 `.layerdrop` 却套 S2
+
+T5ForConditionalGeneration：`hf_layerdrop_off n=0`；97.1 / 62.0 / 59.7（+3.8%，未过 5%）。
+同一 JSON 几乎等于 S3。T5 的 Adam 收益不够。
+
+**反例**：MT5ForConditionalGeneration 也是 n=0，但 82.7 / 47.7 / **39.7（+17%）**。不是 LayerDrop，是 S3 在更大/更碎的 Adam 上够 5%。n=0 不要当 S2；仍要看 vanilla 倍数和步长再决定要不要 compiled Adam。
+
+---
+
+### F5 去编厂商核 / 动态 Python
+
+| 错法 | 结果 |
+|---|---|
+| compile `nn.LSTM` / `allow_rnn=True` | Dynamo 故意 break RNN；Inductor 进 `flatten_parameters`/`data_ptr` 崩 |
+| wrap LSTM 不代理方法 | `_EagerCall` 无 `flatten_parameters` |
+| demucs `reduce-overhead` CUDA Graph 整网 | 411.8 vs vanilla 406.6（LSTM break 挡 cudagraph） |
+| GNN `cached=True` + fullgraph | 图里 `setattr(_cached_edge_index)`，fullgraph 失败；步长 ~4ms launch-bound，compile 无意义 |
+| opacus skipfiles + inner fullgraph | size-assert；回到 hook-eager |
+
+---
+
+## 没跑起来：不是优化方案不支持，是评测加载器 / 环境
+
+这些 case **eager 就失败**，还没进到 `apply_recipe`。不是「任务不支持 S2」，也不是 compile 边界选错。
+Dynamo 官方 harness 能跑（CSV 有数），说明 **agent_loop 的加载路径与 `pytorch/benchmarks/dynamo/huggingface.py` 不对齐**。
+
+管辖划分（与 `repairmemory` 三层一致）：
+
+| 层 | 管什么 | 不要当成 |
+|---|---|---|
+| **测试 bench / eval loader** | 模型怎么构造、config 从哪读、pad_token、假输入、依赖版本 | Agent compile 能力 |
+| **Agent compile** | recipe：编哪、修哪段 Python、cudagraphs、compiled Adam | 补权重、改 protobuf、设 pad_token |
+| **原始 workload** | 不改 Opacus 公式 / Mask R-CNN 结构 | — |
+
+### B1 EXTRA_MODELS 没走 ModelScope 本地路径 — **eval loader**
+
+Dynamo：`AutoConfig.from_pretrained(_ms_pretrained_id(repo))`，本地存在则用
+`$MODELSCOPE_ROOT/<repo>` (optional local mirror).
+
+**已修**（`eval/run_agent_cases.py` `_load_huggingface`）：EXTRA_MODELS 走 `_ms_pretrained_id`。
+重测见下节。
+
+---
+
+### B2 缺 `config.pad_token_id = 0` — **eval loader**
+
+Dynamo 对 GPT2/GPTNeo/GPTJ ForSequenceClassification 以及 Roberta*/Marian* 设 `pad_token_id=0`（BS>1）。
+
+| case | 修前报错 |
+|---|---|
+| GPT2ForSequenceClassification | `Cannot handle batch sizes > 1 if no padding token is defined` |
+| RobertaForCausalLM | embedding `indexSelect` OOB |
+
+**已修**：`_load_huggingface` 同样设置 `pad_token_id = 0`。
+
+---
+
+### B3 whisper Processor + protobuf — **eval loader**（已修）
+
+`WhisperProcessor.from_pretrained` 拉 tensorflow protobuf，与 `protobuf 5.x` 冲突。
+**已修**：`huggingface_llm_models.py` `WhisperBenchmark` 用假 log-mel `(bs, 80, 3000)` + labels，不再 import Processor。模型走 ModelScope。重测是 S2：32.81 / 31.55 / **22.00**（+30%）。
+
+---
+
+### B4 GoogleFnet `only_fp32` — **eval harness**
+
+`huggingface.yaml only_fp32: [GoogleFnet]`：AMP fp16 下 cuFFT 要求维度 2 的幂，seq=512 hidden=768 会挂。
+**已修**：`agent_loop` 自动 AMP 时读该名单关 AMP。
+
+---
+
+### B5 `self.opt` 是 argparse Namespace，不是 Optimizer — **eval loader**
+
+TorchBench `BenchmarkModel.get_optimizer()` 返回 `self.opt`。Background_Matting 用 `self.opt = Namespace(...)` 存超参，真正的 Adam 在 `optimizerG` / `optimizerD`。
+**已修**：`_load_torchbench` 检查 `zero_grad`/`step`，否则用 `optimizerG` 或新建 Adam。
+
+---
+
+### B1/B2 修好后重测（同进程 warmup8/measure40）
+
+加载全部成功。DistillGPT2 / ConvBert / Roberta / GPT2-cls **算加速成功**，已并入上面 **S3 实例表**。T5Small / Longformer 仍未过 5%。GoogleFnet 后改为 S3-step：60.0→56.4（+5.9%）。
+
+GPT2 / Longformer 的 `fullgraph=True` 失败是 **agent recipe**，vanilla `fullgraph=False` 本来就能跑。
+
+---
+
+### 明确不是 bench 的失败（对比）
+
+- detectron/QAT/opacus naive compile 挂：eager 通、vanilla 挂 → **Agent repair（S4/S5）**。
+- DistilBert eager/vanilla 都通、agent 变慢 → **方案误用 F2**。
+- GPT2 setattr / Longformer `.item()` + `fullgraph=True` → **误用 S2**，改 `fullgraph=False`。
+
+---
+
+## 一句话决策树
+
+```
+eager 挂？
+  ├─ 缺 config / pad_token / Processor / protobuf / 假 optimizer → 修 eval loader（B1–B5），不要写 recipe
+  └─ eager 通
+        naive compile 挂？ → S4/S5 repair（只在 naive 真失败时）
+        HF_LLM？
+              compile(model)+外层 AMP 挂或 leftover 在 step → **S3-step compile(train_step)**
+              仍可 explore S3-deep compile(model)+Adam（`--no-amp`）
+        vanilla 慢于 eager？ → skip compile（`actions: []`，resnet18）
+        diagnose fwd：热路径 Python 把主干撕碎、naive≈eager？ → S1
+        .layerdrop 且 n≥1？ → S2（vanilla/eager≤1.20 时收益最大）
+        名叫 CNN 但 conv_frac<0.3 且 P sync 高、Adam？ → S3-fc compiled Adam（vgg16 / alexnet）
+        conv_param_frac≥0.3 且 fwd 0 break？
+              leftover 官方 wrap 上 silu\|mul 拆开 / 可赢的 poi → **S6-fuse**
+              leftover_step（profiler other%≥50）→ **S3-step compile(train_step)**
+              moco / contrastive → identity（不要 wrap）
+              否则 F2-cnn identity（不要编 Adam；小正 fullgraph 可留）
+        _DenseLayer 很多？ → leftover_step 则 S3-step；否则 F6 identity
+        EmbeddingBag / CombinedOptimizer？ → S5
+        FNet FFT / only_fp32 cuFFT / leftover_step？ → S3-step compile(train_step)，不要 fullgraph FFT
+        fwd 0 break + 标准 Adam？
+              skinny / distil → F2-skinny identity
+              unfused bmm+softmax（无 flash ATen，**当前 wrap leftover**）→ **S6-sdpa**
+              leftover Linear+GELU / 拆开 silu×mul → **S6-fuse**
+              vanilla/eager ≤1.20 且 hidden≥768 ≥12 层 → S3-unfused（fullgraph+Adam）
+              vanilla 1.20–2.20× 且 n_tensors~200 → S3b（只编 Adam）
+              ≥20 层且 vanilla_ms≥80 → S3-deep
+              ViT embed≤192 → S3-tiny-vit
+              vocab≥1e5 或 params≥200M → S3-embed
+        setattr / .item() 必须留？ → S3b
+        时间在 LSTM/SDPA/FakeQuant/hooks？ → S5
+        leftover 能自定义 kernel 超过官方（CUTLASS GEMM+act / SE silu_mul / launch-HBM poi）？ → S6-fuse（replace_pattern + compile_step）
+        unfused bmm+softmax（无 flash ATen）？ → **S6-sdpa**（hook + vendor FMHA 或 Triton FA + compile_step）；不要按 DistilBert/OPT 名字过滤
+        否则 identity = naive
+```
+
+---
+
+## 45 个 leftover 为什么没加速（以及还能试什么）
+
+这批几乎全是 **fwd 1 图 / 0 模型 break**。CSV 7–8 break 是 harness glue。对它们套 S3fg（只加 `fullgraph=True`）等于给已经融合的图换 wrap，中位 −0.6%。
+
+按特征分成不同「没空间」原因，不要再当成同一类 leftover：
+
+| 特征簇 | case | 为什么 S3fg 没用 | 别的方案？ |
+|---|---|---|---|
+| **F2-cnn** conv_frac≥0.3，naive 已 2–4× | ghostnet / convnext / inception / mobilenet* / efficientnet | GEMM/conv 已满；fullgraph 不增加融合 | 无。不要 max-autotune（F3）。 |
+| **F2-cnn leftover 1.2–1.8×** | nfnet / mobilevit / repvgg / resnet50 / resnet152 / unet | 仍是 conv 核；resnet50/shufflenet 加 compiled Adam **更慢**；unet 是 RMSprop | 小正 fullgraph 可留；负的改 identity。visformer `conv_frac=0.98` 走这里，不是 ViT。 |
+| **S3-fc** | **vgg16 / alexnet** | 名字像 CNN，**conv_frac 0.04–0.11**，P sync 47–90% | **已赢**：vgg16 +5%、alexnet +12% compiled Adam |
+| **F2-eager** | **resnet18** | vanilla 11.7 > eager 9.9 | **skip compile** `actions: []`，+15% vs naive。**mv3 / functorch_dp / phlippe_densenet 同现象但 skip-compile 接在 vanilla 后会污染（44ms）→ 只改 identity 去掉 fullgraph** |
+| **F6 DenseNet** | densenet121 58×_DenseLayer；**phlippe_densenet 24×DenseLayer** | fullgraph −23% / −1% | identity |
+| **S5 LSTM + Adam sync** | **demucs** | Titan Sequential 切 −1.3%；P sync 91% | **compile(model)+compiled Adam 406→398（+2%）**。step 持平。LSTM 仍 cuDNN break |
+| **F2-vit-base** embed 768 | deit_base / beit / swin / clip / siglip / dinov2 | Adam +2–4% | 不要当 S3-tiny-vit |
+| **S3-tiny-vit** embed 192 | **deit_tiny** | — | **已赢 +13.6%** |
+| **S3b 被误标成 S3fg** | **BERT_pytorch** 12 block / Adam / leftover 1.36× | fullgraph −6.9% | **改 S3b：31.3→27.9（+10.9%）** |
+| **S3-step** | **GoogleFnet** only_fp32 cuFFT | compile(model)+Adam ~1% | **compile(train_step) 60.0→56.4（+5.9%）** |
+| **S5 推荐/embedding** | torchrec_dlrm CombinedOptimizer；nvidia_deeprecommender SGD+12 大矩阵 | vanilla≈eager，厂商 embedding | 不要编 opt / fullgraph |
+| **GNN / unbacked** | basic_gnn_* nonzero+setattr；microbench `.tolist()` | 步长 ~4ms 或故意 break | 不修；launch-bound |
+| **RL Python 在测量区外** | LearningToPaint / drq / sac / maml | `get_module` 只返回小 actor CNN；DDPG/inner-loop 不在 agent_loop 的 step 里 | 改 trainer 才有 S1，不是 recipe |
+| **AMP-off 小步长** | dcgan / sac ~2–12ms | compile overhead ≥ fusion | identity 或 skip compile；**alexnet 走 S3-fc**；**resnet18 走 F2-eager** |
+| **nanogpt** | 已 1.82× + fused AdamW | fullgraph −8.4% | identity（F2） |
+
+深挖结论：这批里真正检索错、已经加速的是 **BERT_pytorch（S3b +10.9%）**、**deit_tiny（S3-tiny-vit +13.6%）**、**GoogleFnet（S3-step +5.9%）**、**vgg16/alexnet（S3-fc）**、**resnet18（skip compile）**、**demucs compiled Adam +2%**。Longformer S1 合图 −5.8%；T5/Longformer `compile(train_step)` 贴线不稳。真 CNN `conv_frac≥0.3` 不要抄 VGG 的 compiled Adam；**demucs 例外**：名字不是 CNN、P 是 91% sync + Adam。`vanilla>eager` 不要无脑 skip compile（同进程接在 vanilla 后会污染）。
+
+---
+
+## 明确没空间（不要再扫）
+
+| case | 为什么没空间 |
+|---|---|
+| Background_Matting / Super_SloMo | CNN 0-break，Adam 只 +0.4–2.8% |
+| pytorch_unet | RMSprop（F2） |
+| visformer / siglip / beit / dinov2 / swin / CLIP / deit_base | F2-vit-base 或 F2-cnn，+1.9–4.4% |
+| T5 / T5Small | vocab 32k / 60M，Adam +3%（F4）。**MT5 是 S3-embed +17%；FNet 是 S3-step +5.9%** |
+| DistilBert / MegatronBert / MobileBert / Electra | F2-skinny（不要因为「BERT」套 S2 JSON） |
+| TIMM CNN naive ≥2.3× | F2-cnn |
+| GNN / microbench tolist / RL actor 小 CNN | 见上表 |
+| GPT-J 6B / Mistral 7B / gemma-3-4b / gpt-oss | OOM |
+| vision_maskrcnn train | naive 已能跑；S4 更慢。**已 identity** |
+| nanogpt / QAT | 编 Adam(W) 已测更慢；FakeQuant 不要 wrap |
+| GNN gcn/sage/gin/edgecnn | identity；gcn 不要 cached+fullgraph |
+| Longformer | S3b +4.9%，未过 5% |
+
+---
+
+## 记分表（同进程 eager / vanilla / agent，ms）
+
+对照永远是同一趟 `agent_loop`。vs naive = `(vanilla−agent)/vanilla`。过 5% 当 `agent < 0.95×vanilla`。detectron 的 vs naive 是相对 eager（vanilla 挂）。† = 不在 frozen Dynamo CSV 的额外 HF。speech / stargan 来自 `agent_speech.csv` / `agent_stargan.csv`。
+
+| suite | case | eager | vanilla | agent | vs naive | vs eager | 结果 | 方案 |
+|---|---|---:|---:|---:|---:|---:|---|---|
+| huggingface | XLNetLMHeadModel | 530.0 | 291.0 | 136.0 | +53.3% | 3.90× | 过 5% | S3 |
+| huggingface | google/gemma-2-2b | 215.2 | 164.6 | 87.3 | +47.0% | 2.47× | 过 5% | S3-deep |
+| huggingface | meta-llama/Llama-3.2-1B | 107.3 | 81.4 | 43.6 | +46.5% | 2.46× | 过 5% | S3-deep |
+| huggingface | BlenderbotForCausalLM | 157.1 | 143.7 | 85.2 | +40.7% | 1.85× | 过 5% | S2 |
+| huggingface | XGLMForCausalLM | 89.5 | 77.4 | 48.7 | +37.1% | 1.84× | 过 5% | S2 |
+| huggingface | openai/whisper-tiny | 32.8 | 31.5 | 22.0 | +30.3% | 1.49× | 过 5% | S2 |
+| huggingface | DebertaV2ForMaskedLM † | 136.1 | 96.9 | 70.6 | +27.1% | 1.93× | 过 5% | S3b |
+| huggingface | Qwen/Qwen3-0.6B | 100.9 | 57.1 | 42.4 | +25.7% | 2.38× | 过 5% | S3-deep |
+| huggingface | BlenderbotForConditionalGeneration † | 376.7 | 325.4 | 245.5 | +24.5% | 1.53× | 过 5% | S2 |
+| huggingface | M2M100ForConditionalGeneration | 100.0 | 82.9 | 64.4 | +22.3% | 1.55× | 过 5% | S2 |
+| huggingface | GPTNeoForSequenceClassification † | 360.6 | 218.8 | 179.5 | +18.0% | 2.01× | 过 5% | S3b |
+| huggingface | MT5ForConditionalGeneration | 82.7 | 47.7 | 39.7 | +16.7% | 2.08× | 过 5% | S3-embed |
+| huggingface | GPTNeoForCausalLM † | 403.8 | 234.4 | 193.2 | +17.6% | 2.09× | 过 5% | S3-step |
+| huggingface | PegasusForCausalLM | 72.1 | 48.3 | 42.0 | +13.0% | 1.72× | 过 5% | S2 |
+| huggingface | BartForCausalLM | 69.1 | 59.9 | 53.5 | +10.7% | 1.29× | 过 5% | S2 |
+| huggingface | GPT2ForSequenceClassification | 49.4 | 37.9 | 34.4 | +9.3% | 1.44× | 过 5% | S3b |
+| huggingface | OPTForCausalLM | 148.0 | 58.7 | 54.1 | +7.9% | 2.74× | 过 5% | S2 |
+| huggingface | MBartForCausalLM | 107.9 | 59.7 | 55.2 | +7.4% | 1.95× | 过 5% | S2 |
+| huggingface | LayoutLMForMaskedLM | 105.6 | 51.3 | 47.8 | +6.8% | 2.21× | 过 5% | S3 |
+| huggingface | TrOCRForCausalLM | 133.7 | 81.2 | 75.6 | +6.8% | 1.77× | 过 5% | S2 |
+| huggingface | RobertaForCausalLM | 131.9 | 59.1 | 55.1 | +6.7% | 2.39× | 过 5% | S3 |
+| huggingface | AlbertForMaskedLM | 521.2 | 304.9 | 285.3 | +6.4% | 1.83× | 过 5% | S3 |
+| huggingface | GoogleFnet | 91.6 | 60.0 | 56.4 | +5.9% | 1.62× | 过 5% | S3-step |
+| huggingface | BertForMaskedLM | 65.0 | 59.0 | 55.7 | +5.6% | 1.17× | 过 5% | S3-unfused |
+| huggingface | DistillGPT2 | 81.2 | 40.4 | 38.1 | +5.6% | 2.13× | 过 5% | S3 |
+| huggingface | YituTechConvBert | 122.4 | 70.4 | 66.5 | +5.5% | 1.84× | 过 5% | S3 |
+| huggingface | PLBartForCausalLM | 96.3 | 48.6 | 45.9 | +5.5% | 2.10× | 过 5% | S2 |
+| huggingface | AllenaiLongformerBase | 171.4 | 71.1 | 67.6 | +4.9% | 2.53× | ≈naive | S3b |
+| huggingface | T5ForConditionalGeneration | 97.1 | 62.0 | 59.6 | +3.8% | 1.63× | ≈naive | F4 |
+| huggingface | T5Small | 95.9 | 61.8 | 60.0 | +2.9% | 1.60× | ≈naive | F4 |
+| huggingface | ElectraForCausalLM | 79.7 | 33.2 | 32.7 | +1.6% | 2.43× | ≈naive | F2-skinny |
+| huggingface | MobileBertForMaskedLM | 153.3 | 87.8 | 93.3 | -6.3% | 1.64× | 慢于 naive | F2-skinny |
+| huggingface | MegatronBertForCausalLM | 92.2 | 57.2 | 77.7 | -35.8% | 1.19× | 慢于 naive | F2-skinny |
+| huggingface | DistilBertForMaskedLM | 176.7 | 66.7 | 112.2 | -68.3% | 1.57× | 慢于 naive | F2-skinny |
+| huggingface | GPTJForCausalLM † | — | — | — | — | — | 失败 | OOM |
+| timm | deit_tiny_patch16_224.fb_in1k | 32.3 | 23.9 | 20.7 | +13.6% | 1.56× | 过 5% | S3-tiny-vit |
+| timm | repvgg_a2 | 71.3 | 42.5 | 40.5 | +4.7% | 1.76× | ≈naive | S3fg/F2 |
+| timm | beit_base_patch16_224 | 77.8 | 58.9 | 56.3 | +4.4% | 1.38× | ≈naive | S3fg/F2 |
+| timm | deit_base_distilled_patch16_224 | 64.0 | 51.0 | 48.9 | +4.1% | 1.31× | ≈naive | S3fg/F2 |
+| timm | swin_base_patch4_window7_224 | 143.2 | 82.7 | 80.0 | +3.3% | 1.79× | ≈naive | S3fg/F2 |
+| timm | dm_nfnet_f0 | 114.7 | 74.0 | 71.9 | +2.9% | 1.60× | ≈naive | S3fg/F2 |
+| timm | mobilevit_s | 75.1 | 50.4 | 49.0 | +2.8% | 1.53× | ≈naive | S3fg/F2 |
+| timm | vit_base_patch16_siglip_256 | 162.7 | 115.9 | 112.9 | +2.6% | 1.44× | ≈naive | S3fg/F2 |
+| timm | vit_base_patch14_dinov2.lvd142m | 128.8 | 101.2 | 98.9 | +2.4% | 1.30× | ≈naive | S3fg/F2 |
+| timm | visformer_small | 87.7 | 70.2 | 68.9 | +1.9% | 1.27× | ≈naive | S3fg/F2 |
+| timm | tf_efficientnet_b0 | 79.9 | 39.9 | 39.2 | +1.8% | 2.04× | ≈naive | S3fg/F2 |
+| timm | mobilenetv3_large_100 | 240.7 | 76.0 | 75.0 | +1.4% | 3.21× | ≈naive | S3fg/F2 |
+| timm | ghostnet_100 | 373.2 | 82.0 | 81.6 | +0.5% | 4.57× | ≈naive | S3fg/F2 |
+| timm | mobilenetv2_100 | 61.8 | 34.6 | 34.5 | +0.5% | 1.79× | ≈naive | S3fg/F2 |
+| timm | inception_v3 | 156.2 | 67.1 | 67.0 | +0.1% | 2.33× | ≈naive | S3fg/F2 |
+| timm | adv_inception_v3 | 156.0 | 66.5 | 66.6 | -0.2% | 2.34× | ≈naive | S3fg/F2 |
+| timm | convnextv2_nano.fcmae_ft_in22k_in1k | 150.9 | 53.6 | 53.9 | -0.4% | 2.80× | ≈naive | S3fg/F2 |
+| timm | nfnet_l0 | 96.9 | 61.2 | 62.4 | -2.0% | 1.55× | ≈naive | S3fg/F2 |
+| torchbench | yolov3 | 68.8 | 68.8 | 44.7 | +35.1% | 1.54× | 过 5% | S1 |
+| torchbench | drq | 3.0 | 3.5 | 2.9 | +17.1% | 1.03× | 噪声(~3ms) | 噪声 |
+| torchbench | BERT_pytorch | 42.6 | 31.3 | 27.9 | +10.9% | 1.53× | 过 5% | S3b |
+| torchbench | detectron2_maskrcnn_r_50_c4 | 91.3 | — | 85.9 | +5.9% | 1.06× | repair | S4 |
+| torchbench | speech_transformer | 39.0 | 35.4 | 33.6 | +5.2% | 1.16× | 过 5% | S1 |
+| torchbench | basic_gnn_gin | 3.0 | 2.5 | 2.4 | +4.5% | 1.25× | ≈naive | GNN |
+| torchbench | lennard_jones | 1.6 | 2.0 | 1.9 | +4.3% | 0.83× | ≈naive | S3fg/F2 |
+| torchbench | microbench_unbacked_tolist_sum | 19.2 | 19.9 | 19.3 | +3.2% | 1.00× | ≈naive | S3fg/F2 |
+| torchbench | Super_SloMo | 79.0 | 58.8 | 57.2 | +2.8% | 1.38× | ≈naive | S3fg/F2 |
+| torchbench | resnext50_32x4d | 25.8 | 26.0 | 25.3 | +2.7% | 1.02× | ≈naive | S3fg/F2 |
+| torchbench | torch_multimodal_clip | 51.7 | 37.2 | 36.3 | +2.3% | 1.42× | ≈naive | S3fg/F2 |
+| torchbench | tts_angular | 12.0 | 11.2 | 11.0 | +2.2% | 1.09× | ≈naive | S5 |
+| torchbench | resnet50 | 36.0 | 33.1 | 32.6 | +1.6% | 1.11× | ≈naive | S3fg/F2 |
+| torchbench | shufflenet_v2_x1_0 | 34.2 | 33.9 | 33.6 | +1.0% | 1.02× | ≈naive | S3fg/F2 |
+| torchbench | phlippe_resnet | 9.5 | 9.3 | 9.3 | +0.4% | 1.03× | ≈naive | S3fg/F2 |
+| torchbench | Background_Matting | 120.9 | 93.8 | 93.4 | +0.4% | 1.29× | ≈naive | S3fg/F2 |
+| torchbench | basic_gnn_sage | 3.5 | 2.2 | 2.2 | +0.2% | 1.59× | ≈naive | GNN |
+| torchbench | pytorch_unet | 54.7 | 45.7 | 45.6 | +0.2% | 1.20× | ≈naive | S3fg/F2 |
+| torchbench | vgg16 | 103.5 | 85.8 | 81.4 | +5.1% | 1.27× | 过 5% | S3-fc |
+| torchbench | alexnet | 14.4 | 11.9 | 10.4 | +12.7% | 1.38× | 过 5% | S3-fc |
+| torchbench | resnet18 | 9.9 | 12.2 | 10.0 | +18.0% | 0.99× | 过 5% | F2-eager |
+| torchbench | resnet152 | 78.8 | 69.8 | 69.8 | +0.0% | 1.13× | ≈naive | F2-cnn |
+| torchbench | functorch_maml_omniglot | 2.3 | 2.2 | 2.3 | -0.9% | 1.01× | ≈naive | RL/meta |
+| torchbench | moco | 58.4 | 52.2 | 52.2 | +0.0% | 1.12× | ≈naive | ident |
+| torchbench | phlippe_densenet | 27.7 | 28.6 | 28.6 | +0.0% | 0.97× | ≈naive | F6 |
+| torchbench | opacus_cifar10 | 37.0 | 37.9 | 37.9 | +0.0% | 0.98× | ≈naive | ident |
+| torchbench | demucs | 424.3 | 406.4 | 398.4 | +2.0% | 1.06× | ≈naive | S3-fc |
+| torchbench | maml_omniglot | 2.3 | 2.8 | 2.9 | -1.6% | 0.82× | ≈naive | RL/meta |
+| torchbench | torchrec_dlrm | 15.5 | 15.1 | 15.0 | +0.5% | 1.04× | ≈naive | ident |
+| torchbench | functorch_dp_cifar10 | 9.4 | 10.1 | 10.1 | +0.0% | 0.93× | ≈naive | ident |
+| torchbench | basic_gnn_edgecnn | 7.2 | 4.5 | 4.6 | -2.2% | 1.58× | ≈naive | GNN |
+| torchbench | mobilenet_v3_large | 30.0 | 33.4 | 33.4 | +0.0% | 0.90× | ≈naive | ident |
+| torchbench | mobilenet_v2 | 66.5 | 35.6 | 35.6 | +0.0% | 1.87× | ≈naive | ident |
+| torchbench | mobilenet_v2_quantized_qat | 132.3 | 95.5 | 95.5 | +0.0% | 1.39× | ≈naive | ident |
+| torchbench | squeezenet1_1 | 9.3 | 8.8 | 8.8 | +0.0% | 1.06× | ≈naive | ident |
+| torchbench | pytorch_stargan | 22.9 | 18.3 | 18.3 | +0.0% | 1.25× | ≈naive | ident |
+| torchbench | vision_maskrcnn | 48.1 | 39.6 | 39.6 | +0.0% | 1.21× | ≈naive | ident |
+| torchbench | LearningToPaint | 14.4 | 13.6 | 13.6 | +0.0% | 1.06× | ≈naive | RL/meta |
+| torchbench | nvidia_deeprecommender | 11.2 | 11.0 | 11.0 | +0.0% | 1.02× | ≈naive | ident |
+| torchbench | mnasnet1_0 | 26.9 | 29.4 | 29.4 | +0.0% | 0.91× | ≈naive | ident |
+| torchbench | dlrm | 6.6 | 4.7 | 4.7 | +0.0% | 1.40× | ≈naive | ident |
+| torchbench | nanogpt | 28.0 | 15.4 | 15.4 | +0.0% | 1.82× | ≈naive | ident |
+| torchbench | fastNLP_Bert | 57.2 | 39.5 | 39.5 | +0.0% | 1.45× | ≈naive | ident |
+| torchbench | dcgan | 2.0 | 2.4 | 2.4 | +0.0% | 0.83× | ≈naive | ident |
+| torchbench | densenet121 | 321.8 | 237.1 | 237.1 | +0.0% | 1.36× | ≈naive | F6 |
+| torchbench | resnet50_quantized_qat | 76.8 | 77.5 | 77.5 | +0.0% | 0.99× | ≈naive | ident |
+| torchbench | soft_actor_critic | 1.6 | 1.6 | 1.6 | +0.0% | 1.00× | ≈naive | RL/meta |
+| torchbench | basic_gnn_gcn | 3.85 | 3.68 | 3.53 | +4.1% | 1.09× | ≈naive | GNN |

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export GKO="${GKO:-${_HERE}}"
+export GKO_PYDEPS="${GKO_PYDEPS:-${GKO}/.pydeps}"
+export BENCHMARK_ROOT="${BENCHMARK_ROOT:-${GKO}/benchmark}"
+export DYNAMO_BENCH_ROOT="${DYNAMO_BENCH_ROOT:-${GKO}/pytorch/benchmarks/dynamo}"
+export PYTHONPATH="${GKO_PYDEPS}:${BENCHMARK_ROOT}:${DYNAMO_BENCH_ROOT}:${GKO}:${PYTHONPATH:-}"
+export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/hub}"
+export TORCH_HOME="${TORCH_HOME:-${HOME}/.cache/torch}"
+export TMPDIR="${TMPDIR:-/tmp}"
+export PYTHONUNBUFFERED=1
+export USE_TORCH="${USE_TORCH:-1}"
+export USE_TF="${USE_TF:-0}"
+PY="${PY:-python3}"
+echo "[gko_env] GKO=${GKO} pydeps=${GKO_PYDEPS}"

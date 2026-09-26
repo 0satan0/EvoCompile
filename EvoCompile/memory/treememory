@@ -1,0 +1,3006 @@
+{
+  "version": 2,
+  "updated": "2026-09-14-s6-sdpa",
+  "doc": "Runtime retrieval tree. Hard match = first matching child `when`. cases = best-so-far per task; trials = append-only win/lose/crash log; paths = tried-scheme order that later similar tasks can skip. Similarity is two-channel kNN (wins to copy, losses to ban) on compact fingerprints — never source or this whole file. After a named scheme is tried, explore_from lists legal next probes. A large win promotes a tree leaf. Re-seed with python -m agent.memory_bootstrap. Narrative: memory/scheme_index.",
+  "hit_policy": "first_match",
+  "schemes": {
+    "B-loader": {
+      "one_line": "eager failed; fix loader, do not compile",
+      "recipe": {
+        "kind": "identity",
+        "note": "eager failed; do not compile"
+      },
+      "do_not": [
+        "compile anything until eager runs"
+      ]
+    },
+    "S4": {
+      "one_line": "naive compile failed; compile static tensor region, leave Python/dynamic eager",
+      "recipe": {
+        "kind": "identity",
+        "note": "S4 repair: start from identity fullgraph=False"
+      },
+      "do_not": [
+        "fullgraph=True on the parent that failed"
+      ]
+    },
+    "S5-qat": {
+      "one_line": "QAT: identity on fp32 GraphModule, do not wrap FakeQuant",
+      "recipe": {
+        "kind": "identity",
+        "note": "S5-qat identity fp32 GraphModule"
+      },
+      "do_not": [
+        "wrap every FakeQuantize"
+      ]
+    },
+    "S5-opacus": {
+      "one_line": "PrivacyEngine: compile inner _module, hooks eager",
+      "recipe": {
+        "kind": "s5_opacus",
+        "note": "S5-opacus"
+      },
+      "do_not": [
+        "skipfiles+inner fullgraph (size-assert)"
+      ]
+    },
+    "S3-deep": {
+      "one_line": "HF_LLM or deep leftover + Adam: compile(model)+compiled Adam, no extra fullgraph",
+      "recipe": {
+        "kind": "compile_adam",
+        "fullgraph": false,
+        "note": "S3-deep"
+      },
+      "do_not": [
+        "compile(model)+outer AMP if bwd dtype fails",
+        "per-layer Titan compile"
+      ]
+    },
+    "F2-eager": {
+      "one_line": "vanilla slower than eager at small step; skip compile",
+      "recipe": {
+        "kind": "skip_compile",
+        "note": "F2-eager: skip compile"
+      },
+      "do_not": [
+        "fullgraph=True",
+        "compile_optimizer"
+      ]
+    },
+    "S1": {
+      "one_line": "hot-path Python/setattr/nonzero/print tears the graph; repair then fullgraph",
+      "recipe": {
+        "kind": "s1_generic",
+        "note": "S1: repair break then compile fullgraph"
+      },
+      "do_not": [
+        "Titan per-Bottleneck compile (F1)",
+        "AST-edit user forward"
+      ]
+    },
+    "S2": {
+      "one_line": "layerdrop_n>=1: hf_layerdrop_off + fullgraph + compiled Adam",
+      "recipe": {
+        "kind": "s2",
+        "note": "S2 LayerDrop"
+      },
+      "do_not": [
+        "hf_layerdrop_off when n=0",
+        "treat Distil/T5 as Bart"
+      ],
+      "examples": "Bart +10.7%; Blenderbot +41%"
+    },
+    "F6": {
+      "one_line": "many DenseLayer concat; identity, no fullgraph",
+      "recipe": {
+        "kind": "identity",
+        "note": "F6 identity, no fullgraph"
+      },
+      "do_not": [
+        "fullgraph=True"
+      ]
+    },
+    "S5-embed": {
+      "one_line": "CombinedOptimizer / EmbeddingBag: identity, do not compile opt",
+      "recipe": {
+        "kind": "identity",
+        "note": "S5 embedding identity"
+      },
+      "do_not": [
+        "compile_optimizer",
+        "fullgraph=True"
+      ]
+    },
+    "S3-step": {
+      "one_line": "leftover is outside compile(model): wrap train_step (fwd+bwd+opt). Official Dynamo boundary.",
+      "recipe": {
+        "kind": "s3_step",
+        "note": "S3-step compile(train_step)"
+      },
+      "do_not": [
+        "nested compile(model)+compile_step",
+        "fullgraph=True on FFT / vendor fallback",
+        "only compile Adam when leftover is train_step Python",
+        "wrap moco/contrastive",
+        "replace S1 rewrite (yolov3)"
+      ],
+      "examples": "GoogleFnet +5.9%; GPTNeoCLM compile(train_step); HF_LLM official wrap"
+    },
+    "S3-fc": {
+      "one_line": "named CNN but low conv_frac / high Linear+sync + Adam → compiled Adam",
+      "recipe": {
+        "kind": "compile_adam",
+        "fullgraph_if_prefix": "vgg",
+        "note": "S3-fc compiled Adam"
+      },
+      "do_not": [
+        "treat as F2-cnn identity"
+      ],
+      "examples": "vgg16 +5%; alexnet +13%"
+    },
+    "F2-cnn": {
+      "one_line": "true CNN 0-break; naive already fused; identity",
+      "recipe": {
+        "kind": "identity",
+        "note": "F2-cnn identity"
+      },
+      "do_not": [
+        "compile_optimizer on true CNN",
+        "channels_last (≈0%)"
+      ]
+    },
+    "S5": {
+      "one_line": "vendor LSTM/RNN; leave eager",
+      "recipe": {
+        "kind": "identity",
+        "note": "S5 identity; optional compile lstm.linear"
+      },
+      "do_not": [
+        "fullgraph the LSTM"
+      ]
+    },
+    "S5+S3": {
+      "one_line": "intentional LSTM break; still compile(model)+Adam if step is long",
+      "recipe": {
+        "kind": "compile_adam",
+        "fullgraph": false,
+        "note": "S5 LSTM eager + compiled Adam"
+      },
+      "do_not": [
+        "compile LSTM into Inductor"
+      ]
+    },
+    "F2-skinny": {
+      "one_line": "skinny/distil/too-small-step transformer; identity not S3",
+      "recipe": {
+        "kind": "identity",
+        "note": "F2-skinny identity"
+      },
+      "do_not": [
+        "copy Bart/S2 JSON",
+        "compiled Adam on DistilBert"
+      ]
+    },
+    "S3-tiny-vit": {
+      "one_line": "ViT embed<=192 leftover; fullgraph+compiled Adam",
+      "recipe": {
+        "kind": "compile_adam",
+        "fullgraph": true,
+        "note": "S3-tiny-vit"
+      },
+      "do_not": [
+        "copy to DeiT-base/Swin/CLIP"
+      ]
+    },
+    "S3-embed": {
+      "one_line": "huge vocab or params; compiled Adam",
+      "recipe": {
+        "kind": "compile_adam",
+        "fullgraph": false,
+        "note": "S3-embed"
+      },
+      "do_not": [
+        "same JSON on T5 vocab 32k / 60M"
+      ]
+    },
+    "S3-unfused": {
+      "one_line": "0-break Adam leftover <=1.20x hidden>=768; fullgraph+Adam",
+      "recipe": {
+        "kind": "compile_adam",
+        "fullgraph": true,
+        "note": "S3-unfused"
+      },
+      "examples": "Bert 65/59/56 +5.6%"
+    },
+    "S3b": {
+      "one_line": "0-break but vanilla already 1.2-2.2x or setattr/.item; no fullgraph + Adam",
+      "recipe": {
+        "kind": "compile_adam",
+        "fullgraph": false,
+        "note": "S3b no fullgraph"
+      },
+      "do_not": [
+        "fullgraph=True (BERT_pytorch -6.9%)"
+      ]
+    },
+    "identity": {
+      "one_line": "no accel scheme; naive compile(model)",
+      "recipe": {
+        "kind": "identity",
+        "note": "identity fallback"
+      },
+      "do_not": [
+        "S3",
+        "fullgraph"
+      ]
+    },
+    "S6-fuse": {
+      "one_line": "custom kernel only when leftover can beat official: CUTLASS GEMM+act / silu_mul / launch-HBM poi; compile(train_step)",
+      "recipe": {
+        "kind": "s6_fuse",
+        "note": "S6 generate/catalog fused kernel then compile_step"
+      },
+      "do_not": [
+        "patch /tmp/torchinductor_* output_code.py",
+        "treat leftover cuBLAS as a site",
+        "GEMM-dominated step with tiny triton/copy",
+        "replace Flash/cuDNN with naive tl.dot",
+        "replace leftover cuDNN conv with CUTLASS conv",
+        "nest compile(model) with compile_step",
+        "one missed_gemm_epilogue flag with no I-channel names"
+      ]
+    },
+    "S6-sdpa": {
+      "one_line": "unfused bmm+softmax: hook attention to vendor FMHA / tiled FA, then compile(train_step)",
+      "recipe": {
+        "kind": "s6_sdpa",
+        "note": "S6-sdpa fused attention rewrite + compile_step"
+      },
+      "do_not": [
+        "custom Triton fused_sdpa first on DistilBert",
+        "copy DistilBert sdpa_rewrite onto Longformer/T5 as the only rewrite",
+        "compiled Adam on DistilBert (F2-skinny −68%)",
+        "overwrite F2-skinny identity as the first DistilBert leaf",
+        "nest compile(model) with compile_step",
+        "handwritten tiled CUTLASS FA (still ~30× vs vendor Flash)"
+      ]
+    }
+  },
+  "tree": {
+    "id": "root",
+    "kind": "switch",
+    "when": {},
+    "children": [
+      {
+        "id": "B-loader",
+        "kind": "leaf",
+        "when": {
+          "eager_ok": false
+        },
+        "scheme": "B-loader",
+        "reason": "eager failed; fix eval loader, do not write a compile recipe",
+        "recipe": {
+          "kind": "identity",
+          "note": "eager failed; do not compile"
+        },
+        "do_not": [
+          "compile anything until eager runs"
+        ],
+        "examples": "",
+        "confidence": "hard"
+      },
+      {
+        "id": "vanilla_fail",
+        "kind": "switch",
+        "when": {
+          "vanilla_ok": false
+        },
+        "children": [
+          {
+            "id": "S4-detectron",
+            "kind": "leaf",
+            "when": {
+              "name_contains": [
+                "detectron",
+                "maskrcnn"
+              ]
+            },
+            "scheme": "S4",
+            "reason": "naive compile failed on detection meta-arch; compile backbone only",
+            "recipe": {
+              "kind": "s4_detectron",
+              "note": "S4: backbone only"
+            },
+            "do_not": [
+              "compile ROI with dynamic=True",
+              "trace Polygon/Instances"
+            ],
+            "examples": "detectron2_maskrcnn_r_50_c4 91→85.9",
+            "confidence": "hard"
+          },
+          {
+            "id": "S5-qat",
+            "kind": "leaf",
+            "when": {
+              "name_contains": [
+                "qat",
+                "quantized"
+              ]
+            },
+            "scheme": "S5-qat",
+            "reason": "QAT: compile fp32 GraphModule, do not wrap every FakeQuant",
+            "recipe": {
+              "kind": "identity",
+              "note": "S5-qat identity fp32 GraphModule"
+            },
+            "do_not": [
+              "wrap every FakeQuantize"
+            ],
+            "examples": "",
+            "confidence": "hard"
+          },
+          {
+            "id": "S5-opacus",
+            "kind": "leaf",
+            "when": {
+              "name_contains": [
+                "opacus"
+              ]
+            },
+            "scheme": "S5-opacus",
+            "reason": "PrivacyEngine hooks: compile inner _module, hooks eager",
+            "recipe": {
+              "kind": "s5_opacus",
+              "note": "S5-opacus"
+            },
+            "do_not": [
+              "skipfiles+inner fullgraph (size-assert)"
+            ],
+            "examples": "",
+            "confidence": "hard"
+          },
+          {
+            "id": "S4-generic",
+            "kind": "leaf",
+            "when": {},
+            "scheme": "S4",
+            "reason": "naive compile failed; leave Python/dynamic eager, compile static tensor region",
+            "recipe": {
+              "kind": "identity",
+              "note": "S4 repair: start from identity fullgraph=False"
+            },
+            "do_not": [
+              "fullgraph=True on the parent that failed"
+            ],
+            "examples": "",
+            "confidence": "hard"
+          }
+        ]
+      },
+      {
+        "id": "S3-step-llm",
+        "kind": "leaf",
+        "when": {
+          "and": [
+            {
+              "is_llm": true
+            },
+            {
+              "adam": true
+            },
+            {
+              "zero_break": true
+            }
+          ]
+        },
+        "scheme": "S3-step",
+        "reason": "HF_LLM 0-break: leftover after compile(model) is autocast/bwd/opt; official wrap is compile(train_step)",
+        "recipe": {
+          "kind": "s3_step",
+          "note": "S3-step HF_LLM compile(train_step)"
+        },
+        "do_not": [
+          "compile(model)+outer AMP if bwd dtype fails",
+          "per-layer Titan compile",
+          "nested compile(model)+compile_step"
+        ],
+        "examples": "Qwen/Llama official Dynamo compile(train_step); S3-deep compile_adam is explore-from",
+        "confidence": "hard"
+      },
+      {
+        "id": "F2-eager",
+        "kind": "leaf",
+        "when": {
+          "and": [
+            {
+              "vanilla_gt_eager": true
+            },
+            {
+              "or": [
+                {
+                  "vanilla_ms_lt": 15
+                },
+                {
+                  "and": [
+                    {
+                      "conv_gte": 0.3
+                    },
+                    {
+                      "vanilla_ms_lt": 40
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "scheme": "F2-eager",
+        "reason": "vanilla slower than eager at small step; skip compile or identity (drop fullgraph)",
+        "recipe": {
+          "kind": "skip_compile",
+          "note": "F2-eager: skip compile"
+        },
+        "do_not": [
+          "fullgraph=True",
+          "compile_optimizer"
+        ],
+        "examples": "resnet18 11.7→9.97 skip compile",
+        "confidence": "hard"
+      },
+      {
+        "id": "S1-hot",
+        "kind": "switch",
+        "when": {
+          "hot_breaks": true
+        },
+        "children": [
+          {
+            "id": "S1-yolo",
+            "kind": "leaf",
+            "when": {
+              "has_yolo": true
+            },
+            "scheme": "S1",
+            "reason": "hot-path setattr/nonzero tears the tower; repair then fullgraph",
+            "recipe": {
+              "kind": "s1_yolo",
+              "note": "S1 yolo"
+            },
+            "do_not": [
+              "compile each Darknet layer separately"
+            ],
+            "examples": "yolov3 68.8→44.7 +35%",
+            "confidence": "hard"
+          },
+          {
+            "id": "S1-speech",
+            "kind": "leaf",
+            "when": {
+              "has_speech": true
+            },
+            "scheme": "S1",
+            "reason": "data-dependent pad-mask / slice; vectorize then fullgraph",
+            "recipe": {
+              "kind": "s1_speech",
+              "note": "S1 speech"
+            },
+            "do_not": [
+              "compile TransformerOptimizer"
+            ],
+            "examples": "",
+            "confidence": "hard"
+          },
+          {
+            "id": "S1-logging",
+            "kind": "leaf",
+            "when": {
+              "has_side_effect": true
+            },
+            "scheme": "S1",
+            "reason": "print/logging/IO graph-break; allow_logging then fullgraph",
+            "recipe": {
+              "kind": "s1_logging",
+              "note": "S1: reorder print/logging then fullgraph"
+            },
+            "do_not": [
+              "AST-edit user forward to delete print",
+              "Titan per-Bottleneck compile (F1)"
+            ],
+            "examples": "",
+            "confidence": "hard"
+          },
+          {
+            "id": "S1-generic",
+            "kind": "leaf",
+            "when": {},
+            "scheme": "S1",
+            "reason": "fwd many graphs/breaks and vanilla≈eager; repair hot-path Python",
+            "recipe": {
+              "kind": "s1_generic",
+              "note": "S1: repair break then compile fullgraph"
+            },
+            "do_not": [
+              "Titan per-Bottleneck compile (F1)"
+            ],
+            "examples": "",
+            "confidence": "hard"
+          }
+        ]
+      },
+      {
+        "id": "S2",
+        "kind": "leaf",
+        "when": {
+          "layerdrop_n_gte": 1
+        },
+        "scheme": "S2",
+        "reason": "layerdrop_n>=1; hf_layerdrop_off + fullgraph + compiled Adam",
+        "recipe": {
+          "kind": "s2",
+          "note": "S2 LayerDrop"
+        },
+        "do_not": [
+          "hf_layerdrop_off when n=0",
+          "treat Distil/T5 as Bart"
+        ],
+        "examples": "Bart +10.7%; Blenderbot +41%",
+        "confidence": "hard"
+      },
+      {
+        "id": "dense-concat",
+        "kind": "switch",
+        "when": {
+          "dense_n_gte": 12
+        },
+        "children": [
+          {
+            "id": "S3-step-dense",
+            "kind": "leaf",
+            "when": {
+              "leftover_step": true
+            },
+            "scheme": "S3-step",
+            "reason": "DenseLayer concat: do not fullgraph; leftover Python/opt is compile(train_step)",
+            "recipe": {
+              "kind": "s3_step",
+              "note": "S3-step wrap train_step, no fullgraph on DenseLayer"
+            },
+            "do_not": [
+              "fullgraph=True",
+              "nested compile(model)+compile_step"
+            ],
+            "examples": "densenet wrap-gap vs identity compile(model)",
+            "confidence": "hard"
+          },
+          {
+            "id": "F6",
+            "kind": "leaf",
+            "when": {},
+            "scheme": "F6",
+            "reason": "DenseLayer concat; fullgraph regresses",
+            "recipe": {
+              "kind": "identity",
+              "note": "F6 identity, no fullgraph"
+            },
+            "do_not": [
+              "fullgraph=True"
+            ],
+            "examples": "densenet121 −23%",
+            "confidence": "hard"
+          }
+        ]
+      },
+      {
+        "id": "S5-embed",
+        "kind": "leaf",
+        "when": {
+          "or": [
+            {
+              "has_combined": true
+            },
+            {
+              "has_embedbag": true
+            }
+          ]
+        },
+        "scheme": "S5-embed",
+        "reason": "CombinedOptimizer / EmbeddingBag: identity, do not compile opt",
+        "recipe": {
+          "kind": "identity",
+          "note": "S5 embedding identity"
+        },
+        "do_not": [
+          "compile_optimizer",
+          "fullgraph=True"
+        ],
+        "examples": "",
+        "confidence": "hard"
+      },
+      {
+        "id": "S3-step",
+        "kind": "leaf",
+        "when": {
+          "or": [
+            {
+              "has_fnet": true
+            },
+            {
+              "leftover_step": true
+            }
+          ]
+        },
+        "scheme": "S3-step",
+        "reason": "leftover after compile(model) is train_step Python / opt.step / vendor fallback; compile(train_step)",
+        "recipe": {
+          "kind": "s3_step",
+          "note": "S3-step compile(train_step)"
+        },
+        "do_not": [
+          "fullgraph=True on FFT / vendor fallback",
+          "only compile Adam when leftover is train_step Python",
+          "wrap moco/contrastive",
+          "replace S1 rewrite (yolov3)",
+          "nested compile(model)+compile_step"
+        ],
+        "examples": "GoogleFnet 60.0→56.4 +5.9%; GPTNeoCLM compile(train_step); 0-break high-Python leftover",
+        "confidence": "hard"
+      },
+      {
+        "id": "S3-fc-head",
+        "kind": "leaf",
+        "when": {
+          "and": [
+            {
+              "conv_lt": 0.3
+            },
+            {
+              "lin_gte": 0.5
+            },
+            {
+              "adam": true
+            },
+            {
+              "sync_gte": 40
+            },
+            {
+              "n_params_gte": 10
+            }
+          ]
+        },
+        "scheme": "S3-fc",
+        "reason": "named CNN but low conv_frac / high Linear+sync + Adam → compiled Adam",
+        "recipe": {
+          "kind": "compile_adam",
+          "fullgraph_if_prefix": "vgg",
+          "note": "S3-fc compiled Adam"
+        },
+        "do_not": [
+          "treat as F2-cnn identity"
+        ],
+        "examples": "vgg16 +5%; alexnet +13%; demucs +2% (LSTM stays cuDNN)",
+        "confidence": "hard"
+      },
+      {
+        "id": "cnn-0break",
+        "kind": "switch",
+        "when": {
+          "and": [
+            {
+              "conv_gte": 0.3
+            },
+            {
+              "zero_break": true
+            }
+          ]
+        },
+        "children": [
+          {
+            "id": "S3-fc-cnn-sync",
+            "kind": "leaf",
+            "when": {
+              "and": [
+                {
+                  "adam": true
+                },
+                {
+                  "sync_gte": 70
+                },
+                {
+                  "vanilla_ms_gte": 80
+                }
+              ]
+            },
+            "scheme": "S3-fc",
+            "reason": "CNN 0-break but profiler other high on a long step; try compiled Adam",
+            "recipe": {
+              "kind": "compile_adam",
+              "fullgraph": false,
+              "note": "CNN with high sync: compiled Adam"
+            },
+            "do_not": [
+              "Titan Sequential split",
+              "compile LSTM"
+            ],
+            "examples": "demucs 406→398; Super_SloMo keep Adam",
+            "confidence": "hard"
+          },
+          {
+            "id": "S6-fuse-cnn",
+            "kind": "leaf",
+            "when": {
+              "has_unfused_epilogue": true
+            },
+            "scheme": "S6-fuse",
+            "reason": "CNN leftover after official compile(train_step): silu_mul / launch-HBM poi; catalog kernel then compile_step",
+            "recipe": {
+              "kind": "s6_fuse",
+              "note": "S6 catalog/generate fused kernel then compile_step"
+            },
+            "do_not": [
+              "naive tl.dot vs cuBLAS",
+              "CUTLASS conv vs cuDNN",
+              "nest compile(model)+compile_step",
+              "drop kernel to pass rel_loss"
+            ],
+            "examples": "silu_mul: mobilenetv2_100 1.07× vs official step",
+            "confidence": "hard"
+          },
+          {
+            "id": "F2-cnn",
+            "kind": "leaf",
+            "when": {},
+            "scheme": "F2-cnn",
+            "reason": "conv_frac high 0-break CNN; naive already fused. identity",
+            "recipe": {
+              "kind": "identity",
+              "note": "F2-cnn identity"
+            },
+            "do_not": [
+              "compile_optimizer on true CNN",
+              "channels_last (≈0%)"
+            ],
+            "examples": "",
+            "confidence": "hard"
+          }
+        ]
+      },
+      {
+        "id": "lstm",
+        "kind": "switch",
+        "when": {
+          "or": [
+            {
+              "has_lstm": true
+            },
+            {
+              "has_rnn": true
+            },
+            {
+              "has_cudnn": true
+            }
+          ]
+        },
+        "children": [
+          {
+            "id": "S5+S3",
+            "kind": "leaf",
+            "when": {
+              "and": [
+                {
+                  "adam": true
+                },
+                {
+                  "vanilla_ms_gte": 80
+                }
+              ]
+            },
+            "scheme": "S5+S3",
+            "reason": "intentional LSTM break; still compile(model)+Adam if step is long",
+            "recipe": {
+              "kind": "compile_adam",
+              "fullgraph": false,
+              "note": "S5 LSTM eager + compiled Adam"
+            },
+            "do_not": [
+              "compile LSTM into Inductor",
+              "Titan per-Sequential"
+            ],
+            "examples": "",
+            "confidence": "hard"
+          },
+          {
+            "id": "S5",
+            "kind": "leaf",
+            "when": {},
+            "scheme": "S5",
+            "reason": "vendor LSTM/RNN; leave eager, maybe compile projection Linear",
+            "recipe": {
+              "kind": "identity",
+              "note": "S5 identity; optional compile lstm.linear"
+            },
+            "do_not": [
+              "fullgraph the LSTM"
+            ],
+            "examples": "",
+            "confidence": "hard"
+          }
+        ]
+      },
+      {
+        "id": "adam-zero-break",
+        "kind": "switch",
+        "when": {
+          "and": [
+            {
+              "adam": true
+            },
+            {
+              "zero_break": true
+            }
+          ]
+        },
+        "children": [
+          {
+            "id": "F2-skinny",
+            "kind": "leaf",
+            "when": {
+              "skinny": true
+            },
+            "scheme": "F2-skinny",
+            "reason": "skinny/distil/too-small-step transformer; identity not S3",
+            "recipe": {
+              "kind": "identity",
+              "note": "F2-skinny identity"
+            },
+            "do_not": [
+              "copy Bart/S2 JSON",
+              "compiled Adam on DistilBert"
+            ],
+            "examples": "DistilBert S3 −68%; Electra +1.6% keep if already tiny win",
+            "confidence": "hard"
+          },
+          {
+            "id": "S6-sdpa",
+            "kind": "leaf",
+            "when": {
+              "unfused_bmm_attention": true
+            },
+            "scheme": "S6-sdpa",
+            "reason": "unfused bmm+softmax leftover (no flash ATen); hook attention + compile(train_step)",
+            "recipe": {
+              "kind": "s6_sdpa",
+              "note": "S6-sdpa fused attention rewrite + compile_step"
+            },
+            "do_not": [
+              "custom Triton fused_sdpa first on DistilBert",
+              "compiled Adam on DistilBert",
+              "nest compile(model)+compile_step",
+              "handwritten tiled CUTLASS FA",
+              "drop kernel/rewrite to pass rel_loss"
+            ],
+            "examples": "OPT vendor FMHA 1.28×; Longformer 1.37×; DistilBert explore after F2-skinny",
+            "confidence": "hard"
+          },
+          {
+            "id": "S6-fuse-attn",
+            "kind": "leaf",
+            "when": {
+              "has_unfused_epilogue": true
+            },
+            "scheme": "S6-fuse",
+            "reason": "Linear+GELU / leftover poi after official wrap; CUTLASS addmm_gelu or generated Triton then compile_step",
+            "recipe": {
+              "kind": "s6_fuse",
+              "note": "S6 catalog/generate fused kernel then compile_step"
+            },
+            "do_not": [
+              "naive tl.dot vs cuBLAS",
+              "nest compile(model)+compile_step",
+              "drop kernel to pass rel_loss"
+            ],
+            "examples": "CUTLASS GEMM+GELU on leftover addmm+gelu",
+            "confidence": "hard"
+          },
+          {
+            "id": "S3-tiny-vit",
+            "kind": "leaf",
+            "when": {
+              "tiny_vit": true
+            },
+            "scheme": "S3-tiny-vit",
+            "reason": "ViT embed<=192 leftover; fullgraph+compiled Adam",
+            "recipe": {
+              "kind": "compile_adam",
+              "fullgraph": true,
+              "note": "S3-tiny-vit"
+            },
+            "do_not": [
+              "copy to DeiT-base/Swin/CLIP"
+            ],
+            "examples": "deit_tiny +13.6%",
+            "confidence": "hard"
+          },
+          {
+            "id": "S3-embed",
+            "kind": "leaf",
+            "when": {
+              "or": [
+                {
+                  "vocab_gte": 100000
+                },
+                {
+                  "n_params_gte": 200
+                }
+              ]
+            },
+            "scheme": "S3-embed",
+            "reason": "large vocab or params; compiled Adam",
+            "recipe": {
+              "kind": "compile_adam",
+              "fullgraph": false,
+              "note": "S3-embed"
+            },
+            "do_not": [
+              "same JSON on T5 vocab 32k / 60M"
+            ],
+            "examples": "MT5 +17%",
+            "confidence": "hard"
+          },
+          {
+            "id": "S3-deep",
+            "kind": "leaf",
+            "when": {
+              "and": [
+                {
+                  "n_layer_gte": 20
+                },
+                {
+                  "vanilla_ms_gte": 80
+                }
+              ]
+            },
+            "scheme": "S3-deep",
+            "reason": "deep leftover + long step; compiled Adam",
+            "recipe": {
+              "kind": "compile_adam",
+              "fullgraph": false,
+              "note": "S3-deep"
+            },
+            "do_not": [
+              "MegatronBert 24 layers but vanilla 57ms"
+            ],
+            "examples": "",
+            "confidence": "hard"
+          },
+          {
+            "id": "S3-unfused",
+            "kind": "leaf",
+            "when": {
+              "and": [
+                {
+                  "ratio_lte": 1.2
+                },
+                {
+                  "hidden_gte": 768
+                },
+                {
+                  "n_layer_gte": 12
+                }
+              ]
+            },
+            "scheme": "S3-unfused",
+            "reason": "0-break Adam leftover <=1.20x hidden>=768; fullgraph+Adam",
+            "recipe": {
+              "kind": "compile_adam",
+              "fullgraph": true,
+              "note": "S3-unfused"
+            },
+            "do_not": [],
+            "examples": "Bert 65/59/56 +5.6%",
+            "confidence": "hard"
+          },
+          {
+            "id": "S3b-item",
+            "kind": "leaf",
+            "when": {
+              "or": [
+                {
+                  "and": [
+                    {
+                      "ratio_gte": 1.2
+                    },
+                    {
+                      "ratio_lte": 2.2
+                    }
+                  ]
+                },
+                {
+                  "has_item": true
+                },
+                {
+                  "has_setattr": true
+                }
+              ]
+            },
+            "scheme": "S3b",
+            "reason": "0-break but vanilla already 1.2-2.2x or setattr/.item; fullgraph=False + Adam",
+            "recipe": {
+              "kind": "compile_adam",
+              "fullgraph": false,
+              "note": "S3b no fullgraph"
+            },
+            "do_not": [
+              "fullgraph=True (BERT_pytorch −6.9%)"
+            ],
+            "examples": "BERT_pytorch +10.9%; GPT2-cls +9.4%",
+            "confidence": "hard"
+          },
+          {
+            "id": "S3b-default",
+            "kind": "leaf",
+            "when": {
+              "adam": true
+            },
+            "scheme": "S3b",
+            "reason": "default leftover transformer + Adam: compile(model)+compiled Adam, no extra fullgraph",
+            "recipe": {
+              "kind": "compile_adam",
+              "fullgraph": false,
+              "note": "S3b default"
+            },
+            "do_not": [],
+            "examples": "",
+            "confidence": "hard"
+          }
+        ]
+      },
+      {
+        "id": "identity-micro",
+        "kind": "leaf",
+        "when": {
+          "or": [
+            {
+              "vanilla_ms_lt": 5
+            },
+            {
+              "n_params_lt": 0.2
+            }
+          ]
+        },
+        "scheme": "identity",
+        "reason": "microbench / GNN / RL actor ~ms; identity",
+        "recipe": {
+          "kind": "identity",
+          "note": "small-step identity"
+        },
+        "do_not": [
+          "S3",
+          "fullgraph"
+        ],
+        "examples": "",
+        "confidence": "hard"
+      },
+      {
+        "id": "S6-sdpa",
+        "kind": "leaf",
+        "when": {
+          "unfused_bmm_attention": true
+        },
+        "scheme": "S6-sdpa",
+        "reason": "unfused bmm+softmax leftover (no flash ATen); hook attention + compile(train_step)",
+        "recipe": {
+          "kind": "s6_sdpa",
+          "note": "S6-sdpa fused attention rewrite + compile_step"
+        },
+        "do_not": [
+          "custom Triton fused_sdpa first on DistilBert",
+          "compiled Adam on DistilBert",
+          "nest compile(model)+compile_step",
+          "handwritten tiled CUTLASS FA"
+        ],
+        "examples": "DistilBert 53.10→49.36 +7.6% vs official step; OPT vendor FMHA 1.28×",
+        "confidence": "hard"
+      },
+      {
+        "id": "S6-fuse",
+        "kind": "leaf",
+        "when": {
+          "has_unfused_epilogue": true
+        },
+        "scheme": "S6-fuse",
+        "reason": "I-channel leftover: CUTLASS GEMM+GELU / silu_mul / generated Triton poi; compile(train_step)",
+        "recipe": {
+          "kind": "s6_fuse",
+          "note": "S6 catalog/generate fused kernel then compile_step"
+        },
+        "do_not": [
+          "patch inductor cache",
+          "S5 abstention",
+          "naive tl.dot vs cuBLAS",
+          "CUTLASS conv vs cuDNN",
+          "nest compile(model)+compile_step"
+        ],
+        "examples": "silu_mul: mobilenetv2_100 1.07×, mnasnet1_0 1.04× vs official step",
+        "confidence": "hard"
+      },
+      {
+        "id": "identity-fallback",
+        "kind": "leaf",
+        "when": {},
+        "scheme": "identity",
+        "reason": "no scheme matched; identity = naive compile(model)",
+        "recipe": {
+          "kind": "identity",
+          "note": "identity fallback"
+        },
+        "do_not": [],
+        "examples": "",
+        "confidence": "low"
+      }
+    ]
+  },
+  "explore_from": {
+    "S3-unfused": [
+      "S6-sdpa",
+      "S6-fuse",
+      "S3b",
+      "S3-step",
+      "identity"
+    ],
+    "S3b": [
+      "S6-sdpa",
+      "S6-fuse",
+      "S3-step",
+      "S3-deep",
+      "identity"
+    ],
+    "S3-deep": [
+      "S6-sdpa",
+      "S3-step",
+      "S3b",
+      "identity"
+    ],
+    "S3-embed": [
+      "S3b",
+      "S3-step",
+      "identity"
+    ],
+    "S3-tiny-vit": [
+      "S3b",
+      "S3-step",
+      "identity"
+    ],
+    "S3-fc": [
+      "S3-step",
+      "identity",
+      "F2-cnn"
+    ],
+    "S3-step": [
+      "S6-sdpa",
+      "S6-fuse",
+      "S3b",
+      "S3-deep",
+      "identity"
+    ],
+    "S2": [
+      "S6-sdpa",
+      "S3b",
+      "S3-step",
+      "identity"
+    ],
+    "S1": [
+      "S3b",
+      "identity"
+    ],
+    "S5+S3": [
+      "S3-step",
+      "S5",
+      "identity"
+    ],
+    "S5": [
+      "S5+S3",
+      "identity"
+    ],
+    "F2-cnn": [
+      "S6-fuse",
+      "S3-step",
+      "S3-fc"
+    ],
+    "F2-skinny": [
+      "S6-sdpa"
+    ],
+    "F6": [
+      "S3-step"
+    ],
+    "F2-eager": [],
+    "identity": [
+      "S6-sdpa",
+      "S6-fuse",
+      "S3-step",
+      "S3b",
+      "S3-fc"
+    ],
+    "S6-fuse": [
+      "S3-step",
+      "S3b",
+      "identity"
+    ],
+    "S4": [],
+    "S5-qat": [],
+    "S5-opacus": [],
+    "S5-embed": [],
+    "B-loader": [],
+    "S6-sdpa": [
+      "S6-fuse",
+      "identity"
+    ]
+  },
+  "cases": [
+    {
+      "case": "BartForCausalLM",
+      "suite": "huggingface",
+      "scheme": "S2",
+      "beat_naive": true,
+      "vs_naive_pct": 10.7,
+      "eager_ms": 69.1,
+      "vanilla_ms": 59.9,
+      "agent_ms": 53.5,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 1,
+        "fwd_graphs": 18,
+        "fwd_breaks": 17,
+        "has_dynamic": true,
+        "zero_break": false,
+        "arch_class": "transformer_base",
+        "n_layer": 12,
+        "n_params_m": 254,
+        "hidden": 1024,
+        "ratio": 1.15,
+        "model_type": "bart",
+        "case": "BartForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 69.1,
+        "vanilla_ms": 59.9
+      }
+    },
+    {
+      "case": "BlenderbotForCausalLM",
+      "suite": "huggingface",
+      "scheme": "S2",
+      "beat_naive": true,
+      "vs_naive_pct": 40.7,
+      "eager_ms": 157.1,
+      "vanilla_ms": 143.7,
+      "agent_ms": 85.2,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 1,
+        "fwd_graphs": 30,
+        "fwd_breaks": 29,
+        "has_dynamic": true,
+        "zero_break": false,
+        "arch_class": "transformer_base",
+        "n_layer": 24,
+        "n_params_m": 2500,
+        "ratio": 1.09,
+        "model_type": "blenderbot",
+        "case": "BlenderbotForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 157.1,
+        "vanilla_ms": 143.7
+      }
+    },
+    {
+      "case": "XGLMForCausalLM",
+      "suite": "huggingface",
+      "scheme": "S2",
+      "beat_naive": true,
+      "vs_naive_pct": 37.1,
+      "eager_ms": 89.5,
+      "vanilla_ms": 77.4,
+      "agent_ms": 48.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 1,
+        "fwd_graphs": 30,
+        "fwd_breaks": 29,
+        "has_dynamic": true,
+        "vocab_size": 256000,
+        "n_layer": 24,
+        "ratio": 1.16,
+        "model_type": "xglm",
+        "case": "XGLMForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 89.5,
+        "vanilla_ms": 77.4
+      }
+    },
+    {
+      "case": "openai/whisper-tiny",
+      "suite": "huggingface",
+      "scheme": "S2",
+      "beat_naive": true,
+      "vs_naive_pct": 30.3,
+      "eager_ms": 32.8,
+      "vanilla_ms": 31.5,
+      "agent_ms": 22.0,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 2,
+        "fwd_graphs": 13,
+        "fwd_breaks": 12,
+        "has_dynamic": true,
+        "n_params_m": 37,
+        "ratio": 1.04,
+        "model_type": "whisper",
+        "case": "openai/whisper-tiny",
+        "suite": "huggingface",
+        "eager_ms": 32.8,
+        "vanilla_ms": 31.5
+      }
+    },
+    {
+      "case": "M2M100ForConditionalGeneration",
+      "suite": "huggingface",
+      "scheme": "S2",
+      "beat_naive": true,
+      "vs_naive_pct": 22.3,
+      "eager_ms": 100.0,
+      "vanilla_ms": 82.9,
+      "agent_ms": 64.4,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 2,
+        "fwd_graphs": 31,
+        "fwd_breaks": 30,
+        "has_dynamic": true,
+        "n_params_m": 484,
+        "ratio": 1.21,
+        "model_type": "m2m_100",
+        "case": "M2M100ForConditionalGeneration",
+        "suite": "huggingface",
+        "eager_ms": 100.0,
+        "vanilla_ms": 82.9
+      }
+    },
+    {
+      "case": "BertForMaskedLM",
+      "suite": "huggingface",
+      "scheme": "S3-unfused",
+      "beat_naive": true,
+      "vs_naive_pct": 5.6,
+      "eager_ms": 65.0,
+      "vanilla_ms": 59.0,
+      "agent_ms": 55.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "hidden": 768,
+        "n_layer": 12,
+        "n_tensors": 199,
+        "n_params_m": 110,
+        "ratio": 1.1,
+        "conv_param_frac": 0.0,
+        "linear_param_frac": 0.8,
+        "sync": 46,
+        "model_type": "bert",
+        "arch_class": "transformer_base",
+        "case": "BertForMaskedLM",
+        "suite": "huggingface",
+        "eager_ms": 65.0,
+        "vanilla_ms": 59.0
+      }
+    },
+    {
+      "case": "meta-llama/Llama-3.2-1B",
+      "suite": "huggingface",
+      "scheme": "S3-deep",
+      "beat_naive": true,
+      "vs_naive_pct": 46.5,
+      "eager_ms": 107.3,
+      "vanilla_ms": 81.4,
+      "agent_ms": 43.6,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "is_llm": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 16,
+        "n_params_m": 1000,
+        "ratio": 1.32,
+        "model_type": "llama",
+        "case": "meta-llama/Llama-3.2-1B",
+        "suite": "huggingface",
+        "eager_ms": 107.3,
+        "vanilla_ms": 81.4
+      }
+    },
+    {
+      "case": "google/gemma-2-2b",
+      "suite": "huggingface",
+      "scheme": "S3-deep",
+      "beat_naive": true,
+      "vs_naive_pct": 47.0,
+      "eager_ms": 215.2,
+      "vanilla_ms": 164.6,
+      "agent_ms": 87.3,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "is_llm": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 26,
+        "n_params_m": 2600,
+        "ratio": 1.31,
+        "model_type": "gemma2",
+        "case": "google/gemma-2-2b",
+        "suite": "huggingface",
+        "eager_ms": 215.2,
+        "vanilla_ms": 164.6
+      }
+    },
+    {
+      "case": "MT5ForConditionalGeneration",
+      "suite": "huggingface",
+      "scheme": "S3-embed",
+      "beat_naive": true,
+      "vs_naive_pct": 16.7,
+      "eager_ms": 82.7,
+      "vanilla_ms": 47.7,
+      "agent_ms": 39.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "vocab_size": 250112,
+        "n_params_m": 300,
+        "n_layer": 16,
+        "ratio": 1.73,
+        "model_type": "mt5",
+        "case": "MT5ForConditionalGeneration",
+        "suite": "huggingface",
+        "eager_ms": 82.7,
+        "vanilla_ms": 47.7
+      }
+    },
+    {
+      "case": "GoogleFnet",
+      "suite": "huggingface",
+      "scheme": "S3-step",
+      "beat_naive": true,
+      "vs_naive_pct": 5.9,
+      "eager_ms": 91.6,
+      "vanilla_ms": 60.0,
+      "agent_ms": 56.4,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 12,
+        "ratio": 1.53,
+        "model_type": "fnet",
+        "has_fnet": true,
+        "sync": 60,
+        "case": "GoogleFnet",
+        "suite": "huggingface",
+        "eager_ms": 91.6,
+        "vanilla_ms": 60.0
+      }
+    },
+    {
+      "case": "GPT2ForSequenceClassification",
+      "suite": "huggingface",
+      "scheme": "S3b",
+      "beat_naive": true,
+      "vs_naive_pct": 9.3,
+      "eager_ms": 49.4,
+      "vanilla_ms": 37.9,
+      "agent_ms": 34.4,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 4,
+        "fwd_breaks": 3,
+        "has_setattr": true,
+        "zero_break": false,
+        "n_layer": 12,
+        "ratio": 1.3,
+        "model_type": "gpt2",
+        "case": "GPT2ForSequenceClassification",
+        "suite": "huggingface",
+        "eager_ms": 49.4,
+        "vanilla_ms": 37.9
+      }
+    },
+    {
+      "case": "BERT_pytorch",
+      "suite": "torchbench",
+      "scheme": "S3b",
+      "beat_naive": true,
+      "vs_naive_pct": 10.9,
+      "eager_ms": 42.6,
+      "vanilla_ms": 31.3,
+      "agent_ms": 27.9,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "n_layer": 12,
+        "ratio": 1.36,
+        "has_setattr": true,
+        "arch_class": "transformer_base",
+        "case": "BERT_pytorch",
+        "suite": "torchbench",
+        "eager_ms": 42.6,
+        "vanilla_ms": 31.3
+      }
+    },
+    {
+      "case": "DistilBertForMaskedLM",
+      "suite": "huggingface",
+      "scheme": "F2-skinny",
+      "beat_naive": false,
+      "vs_naive_pct": 0.0,
+      "eager_ms": 176.7,
+      "vanilla_ms": 66.7,
+      "agent_ms": 66.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 6,
+        "ratio": 2.65,
+        "model_type": "distilbert",
+        "skinny": true,
+        "sync": 64,
+        "arch_class": "transformer_base",
+        "case": "DistilBertForMaskedLM",
+        "suite": "huggingface",
+        "eager_ms": 176.7,
+        "vanilla_ms": 66.7
+      }
+    },
+    {
+      "case": "MegatronBertForCausalLM",
+      "suite": "huggingface",
+      "scheme": "F2-skinny",
+      "beat_naive": false,
+      "vs_naive_pct": 0.0,
+      "eager_ms": 92.2,
+      "vanilla_ms": 57.2,
+      "agent_ms": 57.2,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 24,
+        "vanilla_ms": 57.2,
+        "ratio": 1.61,
+        "skinny": true,
+        "model_type": "megatron-bert",
+        "case": "MegatronBertForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 92.2
+      }
+    },
+    {
+      "case": "MobileBertForMaskedLM",
+      "suite": "huggingface",
+      "scheme": "F2-skinny",
+      "beat_naive": false,
+      "vs_naive_pct": 0.0,
+      "eager_ms": 153.3,
+      "vanilla_ms": 87.8,
+      "agent_ms": 87.8,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 24,
+        "n_tensors": 1117,
+        "skinny": true,
+        "model_type": "mobilebert",
+        "case": "MobileBertForMaskedLM",
+        "suite": "huggingface",
+        "eager_ms": 153.3,
+        "vanilla_ms": 87.8
+      }
+    },
+    {
+      "case": "T5ForConditionalGeneration",
+      "suite": "huggingface",
+      "scheme": "identity",
+      "beat_naive": false,
+      "vs_naive_pct": 3.8,
+      "eager_ms": 97.1,
+      "vanilla_ms": 62.0,
+      "agent_ms": 59.6,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "vocab_size": 32128,
+        "n_params_m": 60,
+        "n_layer": 12,
+        "ratio": 1.57,
+        "model_type": "t5",
+        "case": "T5ForConditionalGeneration",
+        "suite": "huggingface",
+        "eager_ms": 97.1,
+        "vanilla_ms": 62.0
+      }
+    },
+    {
+      "case": "deit_tiny_patch16_224.fb_in1k",
+      "suite": "timm",
+      "scheme": "S3-tiny-vit",
+      "beat_naive": true,
+      "vs_naive_pct": 13.6,
+      "eager_ms": 32.3,
+      "vanilla_ms": 23.9,
+      "agent_ms": 20.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "hidden": 192,
+        "n_layer": 12,
+        "n_params_m": 5.7,
+        "conv_param_frac": 0.026,
+        "ratio": 1.35,
+        "arch_class": "vit_tiny",
+        "tiny_vit": true,
+        "case": "deit_tiny_patch16_224.fb_in1k",
+        "suite": "timm",
+        "eager_ms": 32.3,
+        "vanilla_ms": 23.9
+      }
+    },
+    {
+      "case": "deit_base_distilled_patch16_224",
+      "suite": "timm",
+      "scheme": "F2-cnn",
+      "beat_naive": false,
+      "vs_naive_pct": 4.1,
+      "eager_ms": 64.0,
+      "vanilla_ms": 51.0,
+      "agent_ms": 48.9,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "hidden": 768,
+        "n_layer": 12,
+        "conv_param_frac": 0.0,
+        "ratio": 1.25,
+        "arch_class": "vit_base",
+        "zero_break": true,
+        "fwd_breaks": 0,
+        "case": "deit_base_distilled_patch16_224",
+        "suite": "timm",
+        "eager_ms": 64.0,
+        "vanilla_ms": 51.0
+      }
+    },
+    {
+      "case": "vgg16",
+      "suite": "torchbench",
+      "scheme": "S3-fc",
+      "beat_naive": true,
+      "vs_naive_pct": 5.1,
+      "eager_ms": 103.5,
+      "vanilla_ms": 85.7,
+      "agent_ms": 81.4,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "conv_param_frac": 0.08,
+        "linear_param_frac": 0.9,
+        "sync": 80,
+        "n_params_m": 138,
+        "n_tensors": 32,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "ratio": 1.21,
+        "arch_class": "other",
+        "case": "vgg16",
+        "suite": "torchbench",
+        "eager_ms": 103.5,
+        "vanilla_ms": 85.7
+      }
+    },
+    {
+      "case": "alexnet",
+      "suite": "torchbench",
+      "scheme": "S3-fc",
+      "beat_naive": true,
+      "vs_naive_pct": 12.7,
+      "eager_ms": 14.4,
+      "vanilla_ms": 11.8,
+      "agent_ms": 10.4,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "conv_param_frac": 0.1,
+        "linear_param_frac": 0.85,
+        "sync": 50,
+        "n_params_m": 61,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "ratio": 1.22,
+        "arch_class": "cnn",
+        "case": "alexnet",
+        "suite": "torchbench",
+        "eager_ms": 14.4,
+        "vanilla_ms": 11.8
+      }
+    },
+    {
+      "case": "resnet50",
+      "suite": "torchbench",
+      "scheme": "F2-cnn",
+      "beat_naive": false,
+      "vs_naive_pct": 1.6,
+      "eager_ms": 36.0,
+      "vanilla_ms": 33.1,
+      "agent_ms": 32.6,
+      "source": "seed",
+      "fp": {
+        "adam": false,
+        "opt": "SGD",
+        "conv_param_frac": 0.9,
+        "linear_param_frac": 0.05,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_params_m": 25,
+        "arch_class": "cnn",
+        "ratio": 1.09,
+        "case": "resnet50",
+        "suite": "torchbench",
+        "eager_ms": 36.0,
+        "vanilla_ms": 33.1
+      }
+    },
+    {
+      "case": "resnet18",
+      "suite": "torchbench",
+      "scheme": "F2-eager",
+      "beat_naive": true,
+      "vs_naive_pct": 14.7,
+      "eager_ms": 9.9,
+      "vanilla_ms": 11.7,
+      "agent_ms": 9.97,
+      "source": "seed",
+      "fp": {
+        "adam": false,
+        "opt": "SGD",
+        "conv_param_frac": 0.9,
+        "vanilla_slower": true,
+        "fwd_breaks": 0,
+        "arch_class": "cnn",
+        "ratio": 0.85,
+        "case": "resnet18",
+        "suite": "torchbench",
+        "eager_ms": 9.9,
+        "vanilla_ms": 11.7
+      }
+    },
+    {
+      "case": "densenet121",
+      "suite": "torchbench",
+      "scheme": "F6",
+      "beat_naive": false,
+      "vs_naive_pct": -23.0,
+      "eager_ms": 321.8,
+      "vanilla_ms": 237.1,
+      "agent_ms": 291.6,
+      "source": "seed",
+      "fp": {
+        "adam": false,
+        "opt": "SGD",
+        "dense_n": 58,
+        "conv_param_frac": 0.4,
+        "fwd_breaks": 0,
+        "arch_class": "cnn",
+        "case": "densenet121",
+        "suite": "torchbench",
+        "eager_ms": 321.8,
+        "vanilla_ms": 237.1
+      }
+    },
+    {
+      "case": "yolov3",
+      "suite": "torchbench",
+      "scheme": "S1",
+      "beat_naive": true,
+      "vs_naive_pct": 35.1,
+      "eager_ms": 68.8,
+      "vanilla_ms": 68.8,
+      "agent_ms": 44.7,
+      "source": "seed",
+      "fp": {
+        "adam": false,
+        "fwd_breaks": 25,
+        "hot_breaks": true,
+        "has_yolo": true,
+        "has_setattr": true,
+        "ratio": 1.0,
+        "arch_class": "cnn",
+        "case": "yolov3",
+        "suite": "torchbench",
+        "eager_ms": 68.8,
+        "vanilla_ms": 68.8
+      }
+    },
+    {
+      "case": "speech_transformer",
+      "suite": "torchbench",
+      "scheme": "S1",
+      "beat_naive": true,
+      "vs_naive_pct": 5.2,
+      "eager_ms": 39.0,
+      "vanilla_ms": 35.4,
+      "agent_ms": 33.6,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "fwd_graphs": 7,
+        "fwd_breaks": 17,
+        "hot_breaks": true,
+        "has_speech": true,
+        "has_nonzero": true,
+        "ratio": 1.1,
+        "case": "speech_transformer",
+        "suite": "torchbench",
+        "eager_ms": 39.0,
+        "vanilla_ms": 35.4
+      }
+    },
+    {
+      "case": "detectron2_maskrcnn_r_50_c4",
+      "suite": "torchbench",
+      "scheme": "S4",
+      "beat_naive": true,
+      "vs_naive_pct": 5.9,
+      "eager_ms": 91.3,
+      "vanilla_ms": null,
+      "agent_ms": 85.9,
+      "source": "seed",
+      "fp": {
+        "vanilla_ok": false,
+        "conv_param_frac": 0.8,
+        "fwd_breaks": 40,
+        "adam": false,
+        "opt": "SGD",
+        "case": "detectron2_maskrcnn_r_50_c4",
+        "suite": "torchbench",
+        "eager_ms": 91.3,
+        "vanilla_ms": null
+      }
+    },
+    {
+      "case": "vision_maskrcnn",
+      "suite": "torchbench",
+      "scheme": "identity",
+      "beat_naive": false,
+      "vs_naive_pct": -4.4,
+      "eager_ms": 48.1,
+      "vanilla_ms": 39.6,
+      "agent_ms": 41.3,
+      "source": "seed",
+      "fp": {
+        "vanilla_ok": true,
+        "conv_param_frac": 0.7,
+        "arch_class": "cnn",
+        "case": "vision_maskrcnn",
+        "suite": "torchbench",
+        "eager_ms": 48.1,
+        "vanilla_ms": 39.6
+      }
+    },
+    {
+      "case": "XLNetLMHeadModel",
+      "suite": "huggingface",
+      "scheme": "S3-deep",
+      "beat_naive": true,
+      "vs_naive_pct": 53.3,
+      "eager_ms": 530.0,
+      "vanilla_ms": 291.0,
+      "agent_ms": 136.0,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 24,
+        "n_tensors": 411,
+        "sync": 39,
+        "ratio": 1.82,
+        "model_type": "xlnet",
+        "case": "XLNetLMHeadModel",
+        "suite": "huggingface",
+        "eager_ms": 530.0,
+        "vanilla_ms": 291.0
+      }
+    },
+    {
+      "case": "ElectraForCausalLM",
+      "suite": "huggingface",
+      "scheme": "F2-skinny",
+      "beat_naive": false,
+      "vs_naive_pct": 1.6,
+      "eager_ms": 79.7,
+      "vanilla_ms": 33.2,
+      "agent_ms": 32.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "hidden": 256,
+        "n_layer": 12,
+        "n_params_m": 13.5,
+        "ratio": 2.4,
+        "skinny": true,
+        "zero_break": true,
+        "model_type": "electra",
+        "case": "ElectraForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 79.7,
+        "vanilla_ms": 33.2
+      }
+    },
+    {
+      "case": "basic_gnn_gcn",
+      "suite": "torchbench",
+      "scheme": "identity",
+      "beat_naive": false,
+      "vs_naive_pct": null,
+      "eager_ms": 3.85,
+      "vanilla_ms": 3.68,
+      "agent_ms": 3.53,
+      "source": "seed",
+      "fp": {
+        "n_params_m": 0.1,
+        "vanilla_ms": 3.68,
+        "arch_class": "gnn",
+        "case": "basic_gnn_gcn",
+        "suite": "torchbench",
+        "eager_ms": 3.85
+      }
+    },
+    {
+      "case": "GPTNeoForCausalLM",
+      "suite": "huggingface",
+      "scheme": "S3-step",
+      "beat_naive": true,
+      "vs_naive_pct": 17.6,
+      "eager_ms": 403.8,
+      "vanilla_ms": 234.4,
+      "agent_ms": 193.2,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 24,
+        "n_params_m": 350,
+        "ratio": 1.72,
+        "model_type": "gpt_neo",
+        "leftover_step": true,
+        "leftover_python": true,
+        "sync": 60,
+        "vanilla_ms": 234.4,
+        "case": "GPTNeoForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 403.8
+      }
+    }
+  ],
+  "trials": [
+    {
+      "case": "BartForCausalLM",
+      "suite": "huggingface",
+      "scheme": "S2",
+      "beat_naive": true,
+      "vs_naive_pct": 10.7,
+      "eager_ms": 69.1,
+      "vanilla_ms": 59.9,
+      "agent_ms": 53.5,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 1,
+        "fwd_graphs": 18,
+        "fwd_breaks": 17,
+        "has_dynamic": true,
+        "zero_break": false,
+        "arch_class": "transformer_base",
+        "n_layer": 12,
+        "n_params_m": 254,
+        "hidden": 1024,
+        "ratio": 1.15,
+        "model_type": "bart",
+        "case": "BartForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 69.1,
+        "vanilla_ms": 59.9
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "BlenderbotForCausalLM",
+      "suite": "huggingface",
+      "scheme": "S2",
+      "beat_naive": true,
+      "vs_naive_pct": 40.7,
+      "eager_ms": 157.1,
+      "vanilla_ms": 143.7,
+      "agent_ms": 85.2,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 1,
+        "fwd_graphs": 30,
+        "fwd_breaks": 29,
+        "has_dynamic": true,
+        "zero_break": false,
+        "arch_class": "transformer_base",
+        "n_layer": 24,
+        "n_params_m": 2500,
+        "ratio": 1.09,
+        "model_type": "blenderbot",
+        "case": "BlenderbotForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 157.1,
+        "vanilla_ms": 143.7
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "XGLMForCausalLM",
+      "suite": "huggingface",
+      "scheme": "S2",
+      "beat_naive": true,
+      "vs_naive_pct": 37.1,
+      "eager_ms": 89.5,
+      "vanilla_ms": 77.4,
+      "agent_ms": 48.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 1,
+        "fwd_graphs": 30,
+        "fwd_breaks": 29,
+        "has_dynamic": true,
+        "vocab_size": 256000,
+        "n_layer": 24,
+        "ratio": 1.16,
+        "model_type": "xglm",
+        "case": "XGLMForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 89.5,
+        "vanilla_ms": 77.4
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "openai/whisper-tiny",
+      "suite": "huggingface",
+      "scheme": "S2",
+      "beat_naive": true,
+      "vs_naive_pct": 30.3,
+      "eager_ms": 32.8,
+      "vanilla_ms": 31.5,
+      "agent_ms": 22.0,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 2,
+        "fwd_graphs": 13,
+        "fwd_breaks": 12,
+        "has_dynamic": true,
+        "n_params_m": 37,
+        "ratio": 1.04,
+        "model_type": "whisper",
+        "case": "openai/whisper-tiny",
+        "suite": "huggingface",
+        "eager_ms": 32.8,
+        "vanilla_ms": 31.5
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "M2M100ForConditionalGeneration",
+      "suite": "huggingface",
+      "scheme": "S2",
+      "beat_naive": true,
+      "vs_naive_pct": 22.3,
+      "eager_ms": 100.0,
+      "vanilla_ms": 82.9,
+      "agent_ms": 64.4,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 2,
+        "fwd_graphs": 31,
+        "fwd_breaks": 30,
+        "has_dynamic": true,
+        "n_params_m": 484,
+        "ratio": 1.21,
+        "model_type": "m2m_100",
+        "case": "M2M100ForConditionalGeneration",
+        "suite": "huggingface",
+        "eager_ms": 100.0,
+        "vanilla_ms": 82.9
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "BertForMaskedLM",
+      "suite": "huggingface",
+      "scheme": "S3-unfused",
+      "beat_naive": true,
+      "vs_naive_pct": 5.6,
+      "eager_ms": 65.0,
+      "vanilla_ms": 59.0,
+      "agent_ms": 55.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "hidden": 768,
+        "n_layer": 12,
+        "n_tensors": 199,
+        "n_params_m": 110,
+        "ratio": 1.1,
+        "conv_param_frac": 0.0,
+        "linear_param_frac": 0.8,
+        "sync": 46,
+        "model_type": "bert",
+        "arch_class": "transformer_base",
+        "case": "BertForMaskedLM",
+        "suite": "huggingface",
+        "eager_ms": 65.0,
+        "vanilla_ms": 59.0
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "meta-llama/Llama-3.2-1B",
+      "suite": "huggingface",
+      "scheme": "S3-deep",
+      "beat_naive": true,
+      "vs_naive_pct": 46.5,
+      "eager_ms": 107.3,
+      "vanilla_ms": 81.4,
+      "agent_ms": 43.6,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "is_llm": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 16,
+        "n_params_m": 1000,
+        "ratio": 1.32,
+        "model_type": "llama",
+        "case": "meta-llama/Llama-3.2-1B",
+        "suite": "huggingface",
+        "eager_ms": 107.3,
+        "vanilla_ms": 81.4
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "google/gemma-2-2b",
+      "suite": "huggingface",
+      "scheme": "S3-deep",
+      "beat_naive": true,
+      "vs_naive_pct": 47.0,
+      "eager_ms": 215.2,
+      "vanilla_ms": 164.6,
+      "agent_ms": 87.3,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "is_llm": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 26,
+        "n_params_m": 2600,
+        "ratio": 1.31,
+        "model_type": "gemma2",
+        "case": "google/gemma-2-2b",
+        "suite": "huggingface",
+        "eager_ms": 215.2,
+        "vanilla_ms": 164.6
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "MT5ForConditionalGeneration",
+      "suite": "huggingface",
+      "scheme": "S3-embed",
+      "beat_naive": true,
+      "vs_naive_pct": 16.7,
+      "eager_ms": 82.7,
+      "vanilla_ms": 47.7,
+      "agent_ms": 39.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "vocab_size": 250112,
+        "n_params_m": 300,
+        "n_layer": 16,
+        "ratio": 1.73,
+        "model_type": "mt5",
+        "case": "MT5ForConditionalGeneration",
+        "suite": "huggingface",
+        "eager_ms": 82.7,
+        "vanilla_ms": 47.7
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "GoogleFnet",
+      "suite": "huggingface",
+      "scheme": "S3-step",
+      "beat_naive": true,
+      "vs_naive_pct": 5.9,
+      "eager_ms": 91.6,
+      "vanilla_ms": 60.0,
+      "agent_ms": 56.4,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 12,
+        "ratio": 1.53,
+        "model_type": "fnet",
+        "has_fnet": true,
+        "sync": 60,
+        "case": "GoogleFnet",
+        "suite": "huggingface",
+        "eager_ms": 91.6,
+        "vanilla_ms": 60.0
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "GPT2ForSequenceClassification",
+      "suite": "huggingface",
+      "scheme": "S3b",
+      "beat_naive": true,
+      "vs_naive_pct": 9.3,
+      "eager_ms": 49.4,
+      "vanilla_ms": 37.9,
+      "agent_ms": 34.4,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 4,
+        "fwd_breaks": 3,
+        "has_setattr": true,
+        "zero_break": false,
+        "n_layer": 12,
+        "ratio": 1.3,
+        "model_type": "gpt2",
+        "case": "GPT2ForSequenceClassification",
+        "suite": "huggingface",
+        "eager_ms": 49.4,
+        "vanilla_ms": 37.9
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "BERT_pytorch",
+      "suite": "torchbench",
+      "scheme": "S3b",
+      "beat_naive": true,
+      "vs_naive_pct": 10.9,
+      "eager_ms": 42.6,
+      "vanilla_ms": 31.3,
+      "agent_ms": 27.9,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "n_layer": 12,
+        "ratio": 1.36,
+        "has_setattr": true,
+        "arch_class": "transformer_base",
+        "case": "BERT_pytorch",
+        "suite": "torchbench",
+        "eager_ms": 42.6,
+        "vanilla_ms": 31.3
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "DistilBertForMaskedLM",
+      "suite": "huggingface",
+      "scheme": "F2-skinny",
+      "beat_naive": false,
+      "vs_naive_pct": 0.0,
+      "eager_ms": 176.7,
+      "vanilla_ms": 66.7,
+      "agent_ms": 66.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 6,
+        "ratio": 2.65,
+        "model_type": "distilbert",
+        "skinny": true,
+        "sync": 64,
+        "arch_class": "transformer_base",
+        "case": "DistilBertForMaskedLM",
+        "suite": "huggingface",
+        "eager_ms": 176.7,
+        "vanilla_ms": 66.7
+      },
+      "ok": true,
+      "verdict": "tie"
+    },
+    {
+      "case": "MegatronBertForCausalLM",
+      "suite": "huggingface",
+      "scheme": "F2-skinny",
+      "beat_naive": false,
+      "vs_naive_pct": 0.0,
+      "eager_ms": 92.2,
+      "vanilla_ms": 57.2,
+      "agent_ms": 57.2,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 24,
+        "vanilla_ms": 57.2,
+        "ratio": 1.61,
+        "skinny": true,
+        "model_type": "megatron-bert",
+        "case": "MegatronBertForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 92.2
+      },
+      "ok": true,
+      "verdict": "tie"
+    },
+    {
+      "case": "MobileBertForMaskedLM",
+      "suite": "huggingface",
+      "scheme": "F2-skinny",
+      "beat_naive": false,
+      "vs_naive_pct": 0.0,
+      "eager_ms": 153.3,
+      "vanilla_ms": 87.8,
+      "agent_ms": 87.8,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 24,
+        "n_tensors": 1117,
+        "skinny": true,
+        "model_type": "mobilebert",
+        "case": "MobileBertForMaskedLM",
+        "suite": "huggingface",
+        "eager_ms": 153.3,
+        "vanilla_ms": 87.8
+      },
+      "ok": true,
+      "verdict": "tie"
+    },
+    {
+      "case": "T5ForConditionalGeneration",
+      "suite": "huggingface",
+      "scheme": "identity",
+      "beat_naive": false,
+      "vs_naive_pct": 3.8,
+      "eager_ms": 97.1,
+      "vanilla_ms": 62.0,
+      "agent_ms": 59.6,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "vocab_size": 32128,
+        "n_params_m": 60,
+        "n_layer": 12,
+        "ratio": 1.57,
+        "model_type": "t5",
+        "case": "T5ForConditionalGeneration",
+        "suite": "huggingface",
+        "eager_ms": 97.1,
+        "vanilla_ms": 62.0
+      },
+      "ok": true,
+      "verdict": "tie"
+    },
+    {
+      "case": "deit_tiny_patch16_224.fb_in1k",
+      "suite": "timm",
+      "scheme": "S3-tiny-vit",
+      "beat_naive": true,
+      "vs_naive_pct": 13.6,
+      "eager_ms": 32.3,
+      "vanilla_ms": 23.9,
+      "agent_ms": 20.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "hidden": 192,
+        "n_layer": 12,
+        "n_params_m": 5.7,
+        "conv_param_frac": 0.026,
+        "ratio": 1.35,
+        "arch_class": "vit_tiny",
+        "tiny_vit": true,
+        "case": "deit_tiny_patch16_224.fb_in1k",
+        "suite": "timm",
+        "eager_ms": 32.3,
+        "vanilla_ms": 23.9
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "deit_base_distilled_patch16_224",
+      "suite": "timm",
+      "scheme": "F2-cnn",
+      "beat_naive": false,
+      "vs_naive_pct": 4.1,
+      "eager_ms": 64.0,
+      "vanilla_ms": 51.0,
+      "agent_ms": 48.9,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "hidden": 768,
+        "n_layer": 12,
+        "conv_param_frac": 0.0,
+        "ratio": 1.25,
+        "arch_class": "vit_base",
+        "zero_break": true,
+        "fwd_breaks": 0,
+        "case": "deit_base_distilled_patch16_224",
+        "suite": "timm",
+        "eager_ms": 64.0,
+        "vanilla_ms": 51.0
+      },
+      "ok": true,
+      "verdict": "tie"
+    },
+    {
+      "case": "vgg16",
+      "suite": "torchbench",
+      "scheme": "S3-fc",
+      "beat_naive": true,
+      "vs_naive_pct": 5.1,
+      "eager_ms": 103.5,
+      "vanilla_ms": 85.7,
+      "agent_ms": 81.4,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "conv_param_frac": 0.08,
+        "linear_param_frac": 0.9,
+        "sync": 80,
+        "n_params_m": 138,
+        "n_tensors": 32,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "ratio": 1.21,
+        "arch_class": "other",
+        "case": "vgg16",
+        "suite": "torchbench",
+        "eager_ms": 103.5,
+        "vanilla_ms": 85.7
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "alexnet",
+      "suite": "torchbench",
+      "scheme": "S3-fc",
+      "beat_naive": true,
+      "vs_naive_pct": 12.7,
+      "eager_ms": 14.4,
+      "vanilla_ms": 11.8,
+      "agent_ms": 10.4,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "conv_param_frac": 0.1,
+        "linear_param_frac": 0.85,
+        "sync": 50,
+        "n_params_m": 61,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "ratio": 1.22,
+        "arch_class": "cnn",
+        "case": "alexnet",
+        "suite": "torchbench",
+        "eager_ms": 14.4,
+        "vanilla_ms": 11.8
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "resnet50",
+      "suite": "torchbench",
+      "scheme": "F2-cnn",
+      "beat_naive": false,
+      "vs_naive_pct": 1.6,
+      "eager_ms": 36.0,
+      "vanilla_ms": 33.1,
+      "agent_ms": 32.6,
+      "source": "seed",
+      "fp": {
+        "adam": false,
+        "opt": "SGD",
+        "conv_param_frac": 0.9,
+        "linear_param_frac": 0.05,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_params_m": 25,
+        "arch_class": "cnn",
+        "ratio": 1.09,
+        "case": "resnet50",
+        "suite": "torchbench",
+        "eager_ms": 36.0,
+        "vanilla_ms": 33.1
+      },
+      "ok": true,
+      "verdict": "tie"
+    },
+    {
+      "case": "resnet18",
+      "suite": "torchbench",
+      "scheme": "F2-eager",
+      "beat_naive": true,
+      "vs_naive_pct": 14.7,
+      "eager_ms": 9.9,
+      "vanilla_ms": 11.7,
+      "agent_ms": 9.97,
+      "source": "seed",
+      "fp": {
+        "adam": false,
+        "opt": "SGD",
+        "conv_param_frac": 0.9,
+        "vanilla_slower": true,
+        "fwd_breaks": 0,
+        "arch_class": "cnn",
+        "ratio": 0.85,
+        "case": "resnet18",
+        "suite": "torchbench",
+        "eager_ms": 9.9,
+        "vanilla_ms": 11.7
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "densenet121",
+      "suite": "torchbench",
+      "scheme": "F6",
+      "beat_naive": false,
+      "vs_naive_pct": -23.0,
+      "eager_ms": 321.8,
+      "vanilla_ms": 237.1,
+      "agent_ms": 291.6,
+      "source": "seed",
+      "fp": {
+        "adam": false,
+        "opt": "SGD",
+        "dense_n": 58,
+        "conv_param_frac": 0.4,
+        "fwd_breaks": 0,
+        "arch_class": "cnn",
+        "case": "densenet121",
+        "suite": "torchbench",
+        "eager_ms": 321.8,
+        "vanilla_ms": 237.1
+      },
+      "ok": true,
+      "verdict": "lose"
+    },
+    {
+      "case": "yolov3",
+      "suite": "torchbench",
+      "scheme": "S1",
+      "beat_naive": true,
+      "vs_naive_pct": 35.1,
+      "eager_ms": 68.8,
+      "vanilla_ms": 68.8,
+      "agent_ms": 44.7,
+      "source": "seed",
+      "fp": {
+        "adam": false,
+        "fwd_breaks": 25,
+        "hot_breaks": true,
+        "has_yolo": true,
+        "has_setattr": true,
+        "ratio": 1.0,
+        "arch_class": "cnn",
+        "case": "yolov3",
+        "suite": "torchbench",
+        "eager_ms": 68.8,
+        "vanilla_ms": 68.8
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "speech_transformer",
+      "suite": "torchbench",
+      "scheme": "S1",
+      "beat_naive": true,
+      "vs_naive_pct": 5.2,
+      "eager_ms": 39.0,
+      "vanilla_ms": 35.4,
+      "agent_ms": 33.6,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "fwd_graphs": 7,
+        "fwd_breaks": 17,
+        "hot_breaks": true,
+        "has_speech": true,
+        "has_nonzero": true,
+        "ratio": 1.1,
+        "case": "speech_transformer",
+        "suite": "torchbench",
+        "eager_ms": 39.0,
+        "vanilla_ms": 35.4
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "detectron2_maskrcnn_r_50_c4",
+      "suite": "torchbench",
+      "scheme": "S4",
+      "beat_naive": true,
+      "vs_naive_pct": 5.9,
+      "eager_ms": 91.3,
+      "vanilla_ms": null,
+      "agent_ms": 85.9,
+      "source": "seed",
+      "fp": {
+        "vanilla_ok": false,
+        "conv_param_frac": 0.8,
+        "fwd_breaks": 40,
+        "adam": false,
+        "opt": "SGD",
+        "case": "detectron2_maskrcnn_r_50_c4",
+        "suite": "torchbench",
+        "eager_ms": 91.3,
+        "vanilla_ms": null
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "vision_maskrcnn",
+      "suite": "torchbench",
+      "scheme": "identity",
+      "beat_naive": false,
+      "vs_naive_pct": -4.4,
+      "eager_ms": 48.1,
+      "vanilla_ms": 39.6,
+      "agent_ms": 41.3,
+      "source": "seed",
+      "fp": {
+        "vanilla_ok": true,
+        "conv_param_frac": 0.7,
+        "arch_class": "cnn",
+        "case": "vision_maskrcnn",
+        "suite": "torchbench",
+        "eager_ms": 48.1,
+        "vanilla_ms": 39.6
+      },
+      "ok": true,
+      "verdict": "tie"
+    },
+    {
+      "case": "XLNetLMHeadModel",
+      "suite": "huggingface",
+      "scheme": "S3-deep",
+      "beat_naive": true,
+      "vs_naive_pct": 53.3,
+      "eager_ms": 530.0,
+      "vanilla_ms": 291.0,
+      "agent_ms": 136.0,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 24,
+        "n_tensors": 411,
+        "sync": 39,
+        "ratio": 1.82,
+        "model_type": "xlnet",
+        "case": "XLNetLMHeadModel",
+        "suite": "huggingface",
+        "eager_ms": 530.0,
+        "vanilla_ms": 291.0
+      },
+      "ok": true,
+      "verdict": "win"
+    },
+    {
+      "case": "ElectraForCausalLM",
+      "suite": "huggingface",
+      "scheme": "F2-skinny",
+      "beat_naive": false,
+      "vs_naive_pct": 1.6,
+      "eager_ms": 79.7,
+      "vanilla_ms": 33.2,
+      "agent_ms": 32.7,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "hidden": 256,
+        "n_layer": 12,
+        "n_params_m": 13.5,
+        "ratio": 2.4,
+        "skinny": true,
+        "zero_break": true,
+        "model_type": "electra",
+        "case": "ElectraForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 79.7,
+        "vanilla_ms": 33.2
+      },
+      "ok": true,
+      "verdict": "tie"
+    },
+    {
+      "case": "basic_gnn_gcn",
+      "suite": "torchbench",
+      "scheme": "identity",
+      "beat_naive": false,
+      "vs_naive_pct": null,
+      "eager_ms": 3.85,
+      "vanilla_ms": 3.68,
+      "agent_ms": 3.53,
+      "source": "seed",
+      "fp": {
+        "n_params_m": 0.1,
+        "vanilla_ms": 3.68,
+        "arch_class": "gnn",
+        "case": "basic_gnn_gcn",
+        "suite": "torchbench",
+        "eager_ms": 3.85
+      },
+      "ok": true,
+      "verdict": "tie"
+    },
+    {
+      "case": "DistilBertForMaskedLM",
+      "scheme": "S3-unfused",
+      "beat_naive": false,
+      "vs_naive_pct": -68.3,
+      "ok": true,
+      "eager_ms": 176.7,
+      "vanilla_ms": 66.7,
+      "agent_ms": 112.2,
+      "source": "seed-fail",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 6,
+        "ratio": 2.65,
+        "model_type": "distilbert",
+        "skinny": true,
+        "sync": 64,
+        "hidden": 768,
+        "n_params_m": 66,
+        "arch_class": "transformer_base",
+        "case": "DistilBertForMaskedLM"
+      },
+      "verdict": "lose"
+    },
+    {
+      "case": "MegatronBertForCausalLM",
+      "scheme": "S3-deep",
+      "beat_naive": false,
+      "vs_naive_pct": -35.8,
+      "ok": true,
+      "eager_ms": 92.2,
+      "vanilla_ms": 57.2,
+      "agent_ms": 77.7,
+      "source": "seed-fail",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 24,
+        "ratio": 1.61,
+        "skinny": true,
+        "model_type": "megatron-bert",
+        "hidden": 1024,
+        "n_params_m": 334,
+        "arch_class": "transformer_base",
+        "case": "MegatronBertForCausalLM"
+      },
+      "verdict": "lose"
+    },
+    {
+      "case": "MobileBertForMaskedLM",
+      "scheme": "S3-deep",
+      "beat_naive": false,
+      "vs_naive_pct": -6.3,
+      "ok": true,
+      "eager_ms": 153.3,
+      "vanilla_ms": 87.8,
+      "agent_ms": 93.3,
+      "source": "seed-fail",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 24,
+        "n_tensors": 1117,
+        "skinny": true,
+        "model_type": "mobilebert",
+        "hidden": 128,
+        "n_params_m": 37,
+        "case": "MobileBertForMaskedLM"
+      },
+      "verdict": "lose"
+    },
+    {
+      "case": "densenet121",
+      "scheme": "S3-unfused",
+      "beat_naive": false,
+      "vs_naive_pct": -23.0,
+      "ok": true,
+      "eager_ms": 321.8,
+      "vanilla_ms": 237.1,
+      "agent_ms": 291.6,
+      "source": "seed-fail",
+      "fp": {
+        "adam": false,
+        "opt": "SGD",
+        "dense_n": 58,
+        "conv_param_frac": 0.4,
+        "fwd_breaks": 0,
+        "arch_class": "cnn",
+        "case": "densenet121"
+      },
+      "verdict": "lose"
+    },
+    {
+      "case": "GPTNeoForCausalLM",
+      "suite": "huggingface",
+      "scheme": "S3-step",
+      "beat_naive": true,
+      "vs_naive_pct": 17.6,
+      "eager_ms": 403.8,
+      "vanilla_ms": 234.4,
+      "agent_ms": 193.2,
+      "source": "seed",
+      "fp": {
+        "adam": true,
+        "layerdrop_n": 0,
+        "fwd_graphs": 1,
+        "fwd_breaks": 0,
+        "zero_break": true,
+        "n_layer": 24,
+        "n_params_m": 350,
+        "ratio": 1.72,
+        "model_type": "gpt_neo",
+        "leftover_step": true,
+        "leftover_python": true,
+        "sync": 60,
+        "vanilla_ms": 234.4,
+        "case": "GPTNeoForCausalLM",
+        "suite": "huggingface",
+        "eager_ms": 403.8
+      },
+      "ok": true,
+      "verdict": "win"
+    }
+  ],
+  "paths": [],
+  "evolve_log": []
+}
